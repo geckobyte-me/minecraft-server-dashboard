@@ -3,14 +3,14 @@ input AddUserToServerInput {
 	userEmail: AWSEmail!
 }
 
-# New enum for membership roles
+# Membership roles
 enum MembershipRole {
 	admin
 	moderator
 	viewer
 }
 
-# New type for user membership
+# User membership record
 type UserMembership @aws_iam @aws_cognito_user_pools {
 	userId: String!
 	serverId: String!
@@ -35,32 +35,34 @@ input UpdateUserRoleInput {
 	role: MembershipRole!
 }
 
-input CreateServerInput {
-	serverName: String!
-	instanceType: String!
-	alarmThreshold: Float
-	alarmEvaluationPeriod: Int
-	startScheduleExpression: String
-	stopScheduleExpression: String
-}
-
 type LogAudit @aws_iam
 @aws_cognito_user_pools {
 	id: ID!
 	actionUser: AWSEmail!
 	action: String!
 	instanceId: String!
-	inviteeEmail: AWSEmail	
+	inviteeEmail: AWSEmail
 	expirationEpoch: AWSTimestamp
 	createdAt: AWSDateTime
 }
 
-type ServerLogs @aws_iam
+# A single start/stop transition in an instance's history
+type ServerStateEvent @aws_iam
 @aws_cognito_user_pools {
-	success: Boolean!
-	logs: String
-	error: String
-	instanceId: String
+	timestamp: AWSTimestamp!
+	state: String!
+	actionUser: String
+}
+
+# Uptime summary + recent start/stop history for an instance
+type ServerUptime @aws_iam
+@aws_cognito_user_pools {
+	id: String!
+	state: String
+	currentSessionSeconds: Int
+	totalRunningSeconds: Int
+	windowDays: Int
+	events: [ServerStateEvent]
 }
 
 input LogAuditInput {
@@ -68,24 +70,9 @@ input LogAuditInput {
 	actionUser: AWSEmail!
 	action: String!
 	instanceId: String!
-	inviteeEmail: AWSEmail	
+	inviteeEmail: AWSEmail
 	expirationEpoch: AWSTimestamp
 	createdAt: AWSDateTime
-}
-
-type MonthlyCost @aws_iam
-@aws_cognito_user_pools {
-	id: String!
-	timePeriod: String!
-	UnblendedCost: Float!
-	UsageQuantity: Float!
-}
-
-input MonthlyCostInput {
-	id: String!
-	timePeriod: String
-	UnblendedCost: Float
-	UsageQuantity: Float
 }
 
 input ec2ActionValidatorInput {
@@ -94,53 +81,32 @@ input ec2ActionValidatorInput {
 	params: AWSJSON
 }
 
+# Auto-shutdown metric: CPUUtilization or NetworkOut
 type ServerConfig @aws_iam
 @aws_cognito_user_pools {
 	id: String!
 	stopScheduleExpression: String
 	startScheduleExpression: String
+	alarmMetric: String
 	alarmThreshold: Float
 	alarmEvaluationPeriod: Int
-	runCommand: String
-	workDir: String
 	timezone: String
-	scriptVersion: String
-	isBootstrapComplete: Boolean
-	bootstrapStage: String
-	bootstrapStatus: String
-	bootstrapError: String
 	hasCognitoGroup: Boolean
-	minecraftVersion: String
-	latestPatchUpdate: String
 	createdAt: AWSDateTime
 	updatedAt: AWSDateTime
-	autoConfigured: Boolean
-	runningMinutesCache: Float
-	runningMinutesCacheTimestamp: AWSDateTime
 }
 
 input ServerConfigInput {
 	id: String!
 	stopScheduleExpression: String
 	startScheduleExpression: String
+	alarmMetric: String
 	alarmThreshold: Float
 	alarmEvaluationPeriod: Int
-	runCommand: String
-	workDir: String
 	timezone: String
-	scriptVersion: String
-	isBootstrapComplete: Boolean
-	bootstrapStage: String
-	bootstrapStatus: String
-	bootstrapError: String
 	hasCognitoGroup: Boolean
-	minecraftVersion: String
-	latestPatchUpdate: String
 	createdAt: AWSDateTime
 	updatedAt: AWSDateTime
-	autoConfigured: Boolean
-	runningMinutesCache: Float
-	runningMinutesCacheTimestamp: AWSDateTime
 }
 
 type ServerUsers @aws_iam
@@ -170,15 +136,7 @@ type ServerInfo @aws_iam
 	diskSize: Int
 	launchTime: String
 	publicIp: String
-	initStatus: String
 	iamStatus: String
-	runningMinutes: String
-	runningMinutesCacheTimestamp: String
-	configStatus: String
-	configValid: Boolean
-	configWarnings: [String]
-	configErrors: [String]
-	autoConfigured: Boolean
 }
 
 input ServerInfoInput {
@@ -192,15 +150,7 @@ input ServerInfoInput {
 	diskSize: Int
 	launchTime: String
 	publicIp: String
-	initStatus: String
 	iamStatus: String
-	runningMinutes: String
-	runningMinutesCacheTimestamp: String
-	configStatus: String
-	configValid: Boolean
-	configWarnings: [String]
-	configErrors: [String]
-	autoConfigured: Boolean
 }
 
 type ServerMetric @aws_iam
@@ -209,7 +159,6 @@ type ServerMetric @aws_iam
 	cpuStats: AWSJSON
 	networkStats: AWSJSON
 	memStats: AWSJSON
-	activeUsers: AWSJSON
 }
 
 input ServerMetricInput {
@@ -217,10 +166,9 @@ input ServerMetricInput {
 	cpuStats: AWSJSON
 	networkStats: AWSJSON
 	memStats: AWSJSON
-	activeUsers: AWSJSON
 }
 
-# New type for server action status
+# Server action status (start/stop/config)
 type ec2ActionValidatorStatus @aws_iam
 @aws_cognito_user_pools {
 	id: String!
@@ -245,30 +193,22 @@ type Mutation {
 		@aws_iam @aws_cognito_user_pools
 	changeServerState(input: ServerInfoInput!): ServerInfo
 		@aws_iam
-	
+
 	putec2ActionValidatorStatus(input: ec2ActionValidatorStatusInput!): ec2ActionValidatorStatus
 		@aws_iam @aws_cognito_user_pools
 	startServer(instanceId: String!): AWSJSON
 		@aws_cognito_user_pools
-	restartServer(instanceId: String!): AWSJSON
-		@aws_cognito_user_pools
 	stopServer(instanceId: String!): AWSJSON
 		@aws_cognito_user_pools
-	bootstrapServer(instanceId: String!): AWSJSON
-		@aws_cognito_user_pools
 	iamProfileManager(instanceId: String!): AWSJSON
-		@aws_cognito_user_pools  
+		@aws_cognito_user_pools
 	verifyUserEmail(id: String!): AWSJSON
 		@aws_cognito_user_pools
 	addUserToServer(userEmail: AWSEmail, instanceId: String!): AWSJSON
 		@aws_cognito_user_pools
-	putServerConfig(input: ServerConfigInput!): ServerConfig  
+	putServerConfig(input: ServerConfigInput!): ServerConfig
 		@aws_cognito_user_pools
 	updateServerConfig(input: ServerConfigInput!): ServerConfig
-		@aws_cognito_user_pools 
-	updateServerName(instanceId: String!, newName: String!): AWSJSON
-		@aws_cognito_user_pools
-	createServer(input: CreateServerInput!): AWSJSON
 		@aws_cognito_user_pools
 	putLogAudit(input: LogAuditInput!): LogAudit
 		@aws_iam @aws_cognito_user_pools
@@ -279,7 +219,7 @@ type Mutation {
 }
 
 type Query {
-	ec2Discovery: [ServerInfo]  
+	ec2Discovery: [ServerInfo]
 		@aws_cognito_user_pools
 	getServerConfig(id: String!): ServerConfig
 		@aws_cognito_user_pools
@@ -290,8 +230,8 @@ type Query {
 	searchUserByEmail(email: AWSEmail!): ServerUsers
 		@aws_cognito_user_pools
 	getLogAudit(id: String!): [LogAudit]
-		@aws_cognito_user_pools  
-	getServerLogs(instanceId: String!, lines: Int): ServerLogs
+		@aws_cognito_user_pools
+	getServerUptime(instanceId: String!, days: Int): ServerUptime
 		@aws_cognito_user_pools
 	# Query for historical server metrics
 	ec2MetricsHandler(id: String!): ServerMetric
@@ -299,13 +239,13 @@ type Query {
 }
 
 type Subscription {
-	onPutServerMetric(id: String!): ServerMetric  
+	onPutServerMetric(id: String!): ServerMetric
 		@aws_subscribe(mutations: ["putServerMetric"])
 @aws_cognito_user_pools
 @aws_iam
 
 	onChangeState: ServerInfo
-		@aws_subscribe(mutations: ["changeServerState"])  
+		@aws_subscribe(mutations: ["changeServerState"])
 @aws_cognito_user_pools
 @aws_iam
 

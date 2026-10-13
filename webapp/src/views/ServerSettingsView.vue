@@ -12,9 +12,6 @@
           </div>
           <div class="header-actions">
             <v-btn variant="text" @click="$router.push('/')">Cancel</v-btn>
-            <v-btn variant="outlined" :disabled="!isOnline" @click="handleRestart">
-              <span class="material-symbols-outlined">restart_alt</span>
-            </v-btn>
             <v-btn color="#171717" :loading="saving" @click="saveConfig">
               <span class="material-symbols-outlined">save</span>
               Save
@@ -45,13 +42,6 @@
                 <div class="metric-value">{{ memory.toFixed(0) }}%</div>
               </div>
               <SparkLine :data="history.mem" :width="240" :height="60" color="#171717" />
-            </div>
-            <div class="metric-card">
-              <div class="metric-header">
-                <div class="metric-label">Players</div>
-                <div class="metric-value">{{ players }}</div>
-              </div>
-              <SparkLine :data="history.players" :width="240" :height="60" color="#171717" />
             </div>
             <div class="metric-card">
               <div class="metric-header">
@@ -92,7 +82,11 @@
           </div>
         </div>
 
-        <GeneralProperties v-model="config" />
+        <UptimePanel
+          :server-id="serverId"
+          :launch-time="server?.launchTime || ''"
+          :is-online="isOnline"
+        />
 
         <div class="settings-section">
           <div class="section-header">
@@ -119,10 +113,10 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useServerStore } from '../stores/server'
-import GeneralProperties from '../components/settings/GeneralProperties.vue'
 import ResourceWatchdog from '../components/settings/ResourceWatchdog.vue'
 import TaskScheduler from '../components/settings/TaskScheduler.vue'
 import AccessControlSection from '../components/settings/AccessControlSection.vue'
+import UptimePanel from '../components/settings/UptimePanel.vue'
 import SparkLine from '../components/common/SparkLine.vue'
 
 const route = useRoute()
@@ -143,7 +137,6 @@ const history = computed(() => serverStore.getMetricsHistory(serverId.value))
 
 const cpu = computed(() => metrics.value?.cpuStats || 0)
 const memory = computed(() => metrics.value?.memStats || 0)
-const players = computed(() => metrics.value?.activeUsers ?? 0)
 const networkRx = computed(() => {
   const net = history.value?.net
   if (!net || net.length === 0) return '0 KB/s'
@@ -158,8 +151,7 @@ const saving = ref(false)
 const snackbar = ref({ show: false, text: '', color: 'success' })
 const config = ref({
   id: '',
-  runCommand: '',
-  workDir: '',
+  alarmMetric: 'CPUUtilization',
   alarmThreshold: 0,
   alarmEvaluationPeriod: 10,
   stopScheduleExpression: '',
@@ -196,14 +188,6 @@ const saveConfig = async () => {
     snackbar.value = { show: true, text: 'Failed to save settings', color: 'error' }
   } finally {
     saving.value = false
-  }
-}
-
-const handleRestart = async () => {
-  try {
-    await serverStore.restartServer(serverId.value)
-  } catch (e) {
-    console.error('Failed to restart:', e)
   }
 }
 

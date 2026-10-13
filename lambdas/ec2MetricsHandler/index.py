@@ -31,21 +31,21 @@ def handler(event, context):
     start_time = end_time - timedelta(hours=1)
     
     try:
-        cpu_stats = utl.get_metrics_data(instance_id, 'MinecraftDashboard', 'cpu_usage', 'Percent', 'Average', start_time, end_time, 300)
-        mem_stats = utl.get_metrics_data(instance_id, 'MinecraftDashboard', 'mem_usage', 'Percent', 'Average', start_time, end_time, 300)
-        network_in = utl.get_metrics_data(instance_id, 'MinecraftDashboard', 'transmit_bandwidth', 'Bytes/Second', 'Sum', start_time, end_time, 300)
-        user_stats = utl.get_metrics_data(instance_id, 'MinecraftDashboard', 'user_count', 'Count', 'Maximum', start_time, end_time, 300)
-        
+        # Metrics are published by the CloudWatch agent (CWAgent namespace),
+        # which the user installs/configures on their instance.
+        cpu_stats = utl.get_metrics_data(instance_id, 'CWAgent', 'cpu_usage_active', 'Percent', 'Average', start_time, end_time, 300)
+        mem_stats = utl.get_metrics_data(instance_id, 'CWAgent', 'mem_used_percent', 'Percent', 'Average', start_time, end_time, 300)
+        network_out = utl.get_metrics_data(instance_id, 'AWS/EC2', 'NetworkOut', 'Bytes', 'Average', start_time, end_time, 300)
+
         # Format response
         response = {
             'id': instance_id,
             'cpuStats': json.dumps(cpu_stats),
-            'networkStats': json.dumps(network_in),
-            'memStats': json.dumps(mem_stats),
-            'activeUsers': json.dumps(user_stats)
+            'networkStats': json.dumps(network_out),
+            'memStats': json.dumps(mem_stats)
         }
-        
-        print(f"Returning metrics for {instance_id}: CPU={len(cpu_stats)}, Net={len(network_in)}, Mem={len(mem_stats)}, Users={len(user_stats)}")
+
+        print(f"Returning metrics for {instance_id}: CPU={len(cpu_stats)}, Net={len(network_out)}, Mem={len(mem_stats)}")
         return response
         
     except ClientError as e:

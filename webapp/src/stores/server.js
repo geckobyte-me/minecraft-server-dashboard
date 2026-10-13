@@ -25,16 +25,9 @@ export const useServerStore = defineStore("server", {
   getters: {
     getServerById: (state) => (id) => state.serversById[id],
     getMetricsById: (state) => (id) => state.serverMetrics[id],
-    getMetricsHistory: (state) => (id) => state.metricsHistory[id] || { cpu: [], mem: [], net: [], players: [] },
+    getMetricsHistory: (state) => (id) => state.metricsHistory[id] || { cpu: [], mem: [], net: [] },
     selectedServer: (state) => state.serversById[state.selectedServerId],
     onlineServers: (state) => state.servers.filter(s => s.state === 'running'),
-    totalPlayers: (state) => {
-      return state.servers.reduce((sum, s) => {
-        const metrics = state.serverMetrics[s.id]
-        const players = metrics?.activeUsers
-        return sum + (typeof players === 'number' ? players : 0)
-      }, 0)
-    },
   },
 
   actions: {
@@ -87,8 +80,6 @@ export const useServerStore = defineStore("server", {
       const memValues = parseStat(m.memStats)
       const netValues = parseStat(m.networkStats)
       
-      console.log('Processing metrics for', serverId, { cpuValues, memValues, netValues, activeUsers: m.activeUsers })
-      
       // Get latest value for current metrics
       const latestCpu = cpuValues.length ? cpuValues[cpuValues.length - 1] : 0
       const latestMem = memValues.length ? memValues[memValues.length - 1] : 0
@@ -99,13 +90,12 @@ export const useServerStore = defineStore("server", {
           ...m, 
           cpuStats: latestCpu,
           memStats: latestMem,
-          activeUsers: typeof m.activeUsers === 'number' ? m.activeUsers : 0,
           lastUpdate: new Date() 
         }
       }
       
       // Update history - only add if we have new values
-      const oldHistory = this.metricsHistory[serverId] || { cpu: [], mem: [], net: [], players: [] }
+      const oldHistory = this.metricsHistory[serverId] || { cpu: [], mem: [], net: [] }
       
       if (cpuValues.length > 0 || memValues.length > 0 || netValues.length > 0) {
         this.metricsHistory = {
@@ -113,8 +103,7 @@ export const useServerStore = defineStore("server", {
           [serverId]: {
             cpu: [...oldHistory.cpu, ...cpuValues].slice(-30),
             mem: [...oldHistory.mem, ...memValues].slice(-30),
-            net: [...oldHistory.net, ...netValues].slice(-30),
-            players: [...oldHistory.players, m.activeUsers || 0].slice(-30)
+            net: [...oldHistory.net, ...netValues].slice(-30)
           }
         }
       }
@@ -127,7 +116,7 @@ export const useServerStore = defineStore("server", {
       
       // Initialize history
       if (!this.metricsHistory[serverId]) {
-        this.metricsHistory[serverId] = { cpu: [], mem: [], net: [], players: [] }
+        this.metricsHistory[serverId] = { cpu: [], mem: [], net: [] }
       }
       
       // Fetch initial metrics
@@ -255,6 +244,19 @@ export const useServerStore = defineStore("server", {
       }
     },
 
+    async getServerUptime(serverId, days = 30) {
+      try {
+        const result = await client.graphql({
+          query: queries.getServerUptime,
+          variables: { instanceId: serverId || this.selectedServerId, days }
+        });
+        return result.data.getServerUptime;
+      } catch (error) {
+        this.error = parseGraphQLError(error);
+        throw error;
+      }
+    },
+
     async startServer(serverId) {
       try {
         await client.graphql({
@@ -271,18 +273,6 @@ export const useServerStore = defineStore("server", {
       try {
         await client.graphql({
           query: mutations.stopServer,
-          variables: { instanceId: serverId }
-        });
-      } catch (error) {
-        this.error = parseGraphQLError(error);
-        throw error;
-      }
-    },
-
-    async restartServer(serverId) {
-      try {
-        await client.graphql({
-          query: mutations.restartServer,
           variables: { instanceId: serverId }
         });
       } catch (error) {

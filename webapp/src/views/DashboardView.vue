@@ -13,7 +13,6 @@
     <StatsCards 
       :online="onlineCount" 
       :total="servers.length" 
-      :players="totalPlayers" 
       class="mb-12" 
     />
 
@@ -64,7 +63,6 @@ const serverConfigs = ref({})
 const servers = computed(() => serverStore.servers)
 const loading = computed(() => serverStore.loading)
 const onlineCount = computed(() => serverStore.onlineServers.length)
-const totalPlayers = computed(() => serverStore.totalPlayers)
 
 const filteredServers = computed(() => {
   if (!search.value) return servers.value
@@ -82,8 +80,6 @@ const mapServer = (server) => ({
   state: server.state || 'stopped',
   online: server.state === 'running',
   cpu: server.cpuStats || 0,
-  players: server.activeUsers || 0,
-  maxPlayers: 20,
   memory: server.memSize ? (server.memSize / 1024).toFixed(1) : 0,
   maxMemory: server.memSize ? Math.ceil(server.memSize / 1024) : 8,
 })

@@ -59,10 +59,6 @@
           <SparkLine :data="history.mem" :width="120" :height="32" color="#171717" />
         </div>
         <div class="metric">
-          <div class="metric-label">Players</div>
-          <div class="metric-value">{{ players }}</div>
-        </div>
-        <div class="metric">
           <div class="metric-label">Network</div>
           <div class="metric-value">{{ networkRx }}</div>
         </div>
@@ -88,7 +84,7 @@
     <v-dialog v-model="confirmStop" max-width="400">
       <v-card>
         <v-card-title>Stop Server?</v-card-title>
-        <v-card-text>Stop {{ server.name }}? Active players will be disconnected.</v-card-text>
+        <v-card-text>Stop {{ server.name }}? The server will be shut down.</v-card-text>
         <v-card-actions>
           <v-spacer />
           <v-btn variant="text" @click="confirmStop = false">Cancel</v-btn>
@@ -106,11 +102,11 @@ import SparkLine from '../common/SparkLine.vue'
 const props = defineProps({
   server: { type: Object, required: true },
   metrics: { type: Object, default: null },
-  history: { type: Object, default: () => ({ cpu: [], mem: [], net: [], players: [] }) },
+  history: { type: Object, default: () => ({ cpu: [], mem: [], net: [] }) },
   config: { type: Object, default: null }
 })
 
-const emit = defineEmits(['start', 'stop', 'restart', 'settings'])
+const emit = defineEmits(['start', 'stop', 'settings'])
 
 const actionLoading = ref(false)
 const confirmStart = ref(false)
@@ -145,7 +141,6 @@ watch(isTransitioning, (transitioning) => {
 
 const cpu = computed(() => props.metrics?.cpuStats || props.server.cpu || 0)
 const memory = computed(() => props.metrics?.memStats || 0)
-const players = computed(() => props.metrics?.activeUsers ?? props.server.players ?? 0)
 const networkRx = computed(() => {
   const net = props.history?.net
   if (!net || net.length === 0) return '0 KB/s'

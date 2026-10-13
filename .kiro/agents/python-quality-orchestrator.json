@@ -38,13 +38,54 @@
     "file://ruff.toml"
   ],
   "model": null,
-  "hooks": {
-    "agentSpawn": [
+  "hooks": [
+    {
+      "name": "agentSpawn-0",
+      "trigger": "agentSpawn",
+      "action": {
+        "type": "command",
+        "command": "git ls-files '*.py' | wc -l"
+      },
+      "timeout": 3,
+      "maxOutputSize": 512
+    }
+  ],
+  "permissions": {
+    "rules": [
       {
-        "command": "git ls-files '*.py' | wc -l",
-        "timeout_ms": 3000,
-        "max_output_size": 512
+        "capability": "shell",
+        "match": [
+          "ruff check",
+          "ruff format --check",
+          "find",
+          "git diff",
+          "git ls-files",
+          "wc",
+          "cat"
+        ],
+        "effect": "allow"
+      },
+      {
+        "capability": "fs_read",
+        "effect": "allow"
+      },
+      {
+        "capability": "shell",
+        "effect": "allow"
+      },
+      {
+        "capability": "subagent",
+        "effect": "allow"
+      },
+      {
+        "capability": "skill",
+        "effect": "allow"
       }
     ]
+  },
+  "kiroUpgrade": {
+    "revision": 2,
+    "fingerprint": "sha256:eb69a6f8814af029550d7525f083780bd58387651b77a00c1db2a368972d9ec7",
+    "source": "sha256:09508a6b9947a19461a1c26af4a14a9e51d6bfbde2dae4fda537444e04728f52"
   }
 }

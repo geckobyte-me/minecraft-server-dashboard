@@ -8,14 +8,12 @@ export const putServerMetric = /* GraphQL */ `
       cpuStats
       networkStats
       memStats
-      activeUsers
-      alertMsg
     }
   }
 `;
-export const onChangeState = /* GraphQL */ `
-  mutation OnChangeState($input: ServerInfoInput!) {
-    onChangeState(input: $input) {
+export const changeServerState = /* GraphQL */ `
+  mutation ChangeServerState($input: ServerInfoInput!) {
+    changeServerState(input: $input) {
       id
       name
       type
@@ -26,9 +24,7 @@ export const onChangeState = /* GraphQL */ `
       diskSize
       launchTime
       publicIp
-      initStatus
       iamStatus
-      runningMinutes
     }
   }
 `;
@@ -45,11 +41,6 @@ export const startServer = /* GraphQL */ `
 export const stopServer = /* GraphQL */ `
   mutation StopServer($instanceId: String!) {
     stopServer(instanceId: $instanceId) 
-  }
-`;
-export const restartServer = /* GraphQL */ `
-  mutation RestartServer($instanceId: String!) {
-    restartServer(instanceId: $instanceId) 
   }
 `;
 
@@ -84,33 +75,36 @@ export const PutLogAuditWithInviteeEmail = /* GraphQL */ `
   }
 `;
 
-export const deleteLoginAudit = /* GraphQL */ `
-  mutation DeleteLoginAudit(
-    $input: id!
-  ) {
-    deleteLoginAudit(input: $input) {
-      id
-    }
-  }
-`;
-
 export const putServerConfig = /* GraphQL */ `
   mutation PutServerConfig($input: ServerConfigInput!) {
     putServerConfig(input: $input) {
       id
-      runCommand
-      workDir
       stopScheduleExpression
       startScheduleExpression
+      alarmMetric
       alarmThreshold
       alarmEvaluationPeriod
       timezone
-      isBootstrapComplete
-      minecraftVersion
-      latestPatchUpdate
+      hasCognitoGroup
       createdAt
       updatedAt
-      autoConfigured
+    }
+  }
+`;
+
+export const updateServerConfig = /* GraphQL */ `
+  mutation UpdateServerConfig($input: ServerConfigInput!) {
+    updateServerConfig(input: $input) {
+      id
+      stopScheduleExpression
+      startScheduleExpression
+      alarmMetric
+      alarmThreshold
+      alarmEvaluationPeriod
+      timezone
+      hasCognitoGroup
+      createdAt
+      updatedAt
     }
   }
 `;
@@ -120,14 +114,22 @@ export const addUserToServer = /* GraphQL */ `
     addUserToServer(instanceId: $instanceId, userEmail: $userEmail)
   }
 `;
-export const updateServerName = /* GraphQL */ `
-  mutation UpdateServerName($instanceId: String!, $newName: String!) {
-    updateServerName(instanceId: $instanceId, newName: $newName)
+
+export const verifyUserEmail = /* GraphQL */ `
+  mutation VerifyUserEmail($id: String!) {
+    verifyUserEmail(id: $id)
   }
 `;
-export const createServer = /* GraphQL */ `
-  mutation CreateServer($input: CreateServerInput!) {
-    createServer(input: $input)
+
+export const updateUserRole = /* GraphQL */ `
+  mutation UpdateUserRole($input: UpdateUserRoleInput!) {
+    updateUserRole(input: $input)
+  }
+`;
+
+export const removeUserFromServer = /* GraphQL */ `
+  mutation RemoveUserFromServer($userId: String!, $serverId: String!) {
+    removeUserFromServer(userId: $userId, serverId: $serverId)
   }
 `;
 

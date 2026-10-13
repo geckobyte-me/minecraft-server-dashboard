@@ -175,19 +175,32 @@ class Ec2Utils:
 
 
     def update_alarm(self, instance_id, alarm_metric, alarm_threshold, alarm_evaluation_period):
+        """Create/update a CloudWatch alarm that auto-stops the instance when idle.
+
+        Supported alarm_metric values:
+          - "CPUUtilization": uses the CloudWatch agent metric cpu_usage_active
+            (namespace CWAgent, Average). Requires the agent on the instance.
+          - "NetworkOut": uses the native EC2 metric NetworkOut (namespace
+            AWS/EC2, Average, bytes). Requires no agent.
+
+        The alarm fires (and stops the instance) when the metric stays at or
+        below the threshold for alarm_evaluation_period consecutive minutes.
+        """
         logger.info("------- update_alarm : " + instance_id)
 
-        dimensions=[]
-        statistic="Average" 
-        namespace="CWAgent"
-        dimensions.append({'Name': 'InstanceId','Value': instance_id})
-        if alarm_metric == "CPUUtilization":
-            alarmMetricName = "cpu_usage_active"        
-            dimensions.append({'Name': 'cpu','Value': "cpu-total"})
-        elif alarm_metric == "Connections":
-            alarmMetricName = "UserCount"
-            statistic="Maximum"
-            namespace="MinecraftDashboard"
+        dimensions = [{'Name': 'InstanceId', 'Value': instance_id}]
+        statistic = "Average"
+
+        if alarm_metric == "NetworkOut":
+            # Native EC2 metric, no agent required. Threshold is bytes/minute.
+            alarmMetricName = "NetworkOut"
+            namespace = "AWS/EC2"
+        else:
+            # Default to CPU-based shutdown (CloudWatch agent metric).
+            alarm_metric = "CPUUtilization"
+            alarmMetricName = "cpu_usage_active"
+            namespace = "CWAgent"
+            dimensions.append({'Name': 'cpu', 'Value': "cpu-total"})
 
         self.cw_client.put_metric_alarm(
             AlarmName=instance_id + "-" + "minecraft-server",
@@ -203,7 +216,7 @@ class Ec2Utils:
             DatapointsToAlarm=int(alarm_evaluation_period),
             Threshold=float(alarm_threshold),  # Use float to support decimal thresholds
             TreatMissingData="missing",
-            ComparisonOperator="LessThanOrEqualToThreshold"   
+            ComparisonOperator="LessThanOrEqualToThreshold"
         )
 
         logger.info(f"Alarm configured to {alarm_metric} with threshold {alarm_threshold} and evaluation period {alarm_evaluation_period}")

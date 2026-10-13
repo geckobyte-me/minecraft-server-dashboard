@@ -13,10 +13,7 @@ Parameters:
     Description: Value of the application
   SupportBucketName:
     Type: String
-    Description: Pre-existing S3 support bucket name from CircleCI
-  FrontendBucketName:
-    Type: String
-    Description: Pre-existing S3 frontend bucket name from CircleCI
+    Description: Artifacts/support S3 bucket name (from the CircleCI plumbing stack)
 
 
 Resources:
@@ -39,6 +36,15 @@ Resources:
         EnvironmentName: !Ref EnvironmentName
         AppValue: !Ref AppValue
 
+  WebStack:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location: ./templates/web.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        EnvironmentName: !Ref EnvironmentName
+        AppValue: !Ref AppValue
+
   EC2Stack:
     Type: AWS::Serverless::Application
     DependsOn: DynamoDBStack
@@ -49,18 +55,6 @@ Resources:
         EnvironmentName: !Ref EnvironmentName
         AppValue: !Ref AppValue
         SupportBucketName: !Ref SupportBucketName
-
-  SSMStack:
-    Type: AWS::Serverless::Application
-    DependsOn: DynamoDBStack
-    Properties:
-      Location: ./templates/ssm.yaml
-      Parameters:
-        ProjectName: !Ref ProjectName
-        EnvironmentName: !Ref EnvironmentName
-        AppValue: !Ref AppValue
-        SupportBucket: !Ref SupportBucketName
-        ScriptVersion: latest
 
   LambdasStack:
     Type: AWS::Serverless::Application
@@ -73,11 +67,9 @@ Resources:
         ProjectName: !Ref ProjectName
         EnvironmentName: !Ref EnvironmentName
         AppValue: !Ref AppValue
-        BootstrapSSMDoc: !GetAtt SSMStack.Outputs.BootstrapDocumentName
         IAMEC2RoleArn: !GetAtt EC2Stack.Outputs.IAMEC2RoleArn
         IAMEC2InstanceProfile: !GetAtt EC2Stack.Outputs.IAMEC2InstanceProfile
         IAMEC2InstanceProfileArn: !GetAtt EC2Stack.Outputs.IAMEC2InstanceProfileArn
-        SupportBucket: !Ref SupportBucketName
 
 Outputs:
   GraphQLAPIEndpoint:
@@ -101,9 +93,17 @@ Outputs:
     Value: !GetAtt CognitoStack.Outputs.CognitoDomainName
 
   SupportBucket:
-    Description: S3 Support Bucket Name
+    Description: S3 Support/Artifacts Bucket Name
     Value: !Ref SupportBucketName
 
-  FrontendBucket:
-    Description: S3 Frontend Bucket Name
-    Value: !Ref FrontendBucketName
+  WebAppBucket:
+    Description: S3 Frontend Hosting Bucket Name
+    Value: !GetAtt WebStack.Outputs.WebAppBucket
+
+  CloudFront:
+    Description: CloudFront Distribution ID
+    Value: !GetAtt WebStack.Outputs.CloudFront
+
+  CloudFrontDomain:
+    Description: CloudFront Distribution Domain Name
+    Value: !GetAtt WebStack.Outputs.CloudFrontDomain

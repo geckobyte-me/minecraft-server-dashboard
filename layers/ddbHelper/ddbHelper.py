@@ -94,20 +94,13 @@ class CoreTableDyn:
             'id': instance_id,
             'stopScheduleExpression': item.get('stopScheduleExpression', ''),
             'startScheduleExpression': item.get('startScheduleExpression', ''),
+            'alarmMetric': item.get('alarmMetric', 'CPUUtilization'),
             'alarmThreshold': self._safe_float(item.get('alarmThreshold'), 0.0),
             'alarmEvaluationPeriod': self._safe_int(item.get('alarmEvaluationPeriod'), 0),
-            'runCommand': item.get('runCommand', ''),
-            'workDir': item.get('workDir', ''),
             'timezone': item.get('timezone', 'UTC'),
-            'isBootstrapComplete': bool(item.get('isBootstrapComplete', False)),
             'hasCognitoGroup': bool(item.get('hasCognitoGroup', False)),
-            'minecraftVersion': item.get('minecraftVersion', ''),
-            'latestPatchUpdate': item.get('latestPatchUpdate', ''),
-            'runningMinutesCache': self._safe_float(item.get('runningMinutesCache'), None),
-            'runningMinutesCacheTimestamp': item.get('runningMinutesCacheTimestamp', ''),
             'createdAt': item.get('createdAt', ''),
-            'updatedAt': item.get('updatedAt', ''),
-            'autoConfigured': item.get('autoConfigured', False)
+            'updatedAt': item.get('updatedAt', '')
         }
 
     def put_server_config(self, config):
@@ -125,26 +118,17 @@ class CoreTableDyn:
             'Type': 'Server',
             'stopScheduleExpression': config.get('stopScheduleExpression', ''),
             'startScheduleExpression': config.get('startScheduleExpression', ''),
+            'alarmMetric': config.get('alarmMetric', 'CPUUtilization'),
             'alarmThreshold': self._to_decimal(round(config.get('alarmThreshold', 0.0), 1)),
             'alarmEvaluationPeriod': config.get('alarmEvaluationPeriod', 0),
-            'runCommand': config.get('runCommand', ''),
-            'workDir': config.get('workDir', ''),
             'timezone': config.get('timezone', 'UTC'),
-            'isBootstrapComplete': config.get('isBootstrapComplete', False),
-            'minecraftVersion': config.get('minecraftVersion', ''),
-            'latestPatchUpdate': config.get('latestPatchUpdate', ''),
             'updatedAt': now,
             'createdAt': existing.get('createdAt', config.get('createdAt', now))
         })
-        
-        if 'autoConfigured' in config:
-            existing['autoConfigured'] = config['autoConfigured']
-        
-        if config.get('runningMinutesCache') is not None:
-            existing['runningMinutesCache'] = self._to_decimal(config['runningMinutesCache'])
-        if config.get('runningMinutesCacheTimestamp'):
-            existing['runningMinutesCacheTimestamp'] = config['runningMinutesCacheTimestamp']
-        
+
+        if 'hasCognitoGroup' in config:
+            existing['hasCognitoGroup'] = config['hasCognitoGroup']
+
         self.table.put_item(Item=existing)
         return self.get_server_config(instance_id)
 
@@ -357,6 +341,95 @@ class LogAuditTable:
         
         self.table.put_item(Item=item)
         logger.info(f"Logged action: {action} for {instance_id} by {action_user}")
+
+    def log_state_transition(self, instance_id, state, event_epoch, action_user='external'):
+        """
+        Record an EC2 state transition (running/stopped) for uptime history.
+
+        These rows are namespaced with action 'state:<state>' so the uptime
+        timeline can be queried independently of app click-audit rows. They are
+        written from ec2StateHandler, which fires on EVERY EC2 state change
+        (app, console, CLI, alarm, schedule), so the timeline is origin-agnostic.
+
+        Args:
+            instance_id: EC2 instance ID
+            state: 'running' or 'stopped'
+            event_epoch: Unix epoch (int seconds) of the transition
+            action_user: Best-effort attribution ('external' for non-app origins)
+        """
+        timestamp = int(event_epoch)
+        item = {
+            'id': instance_id,
+            'timestamp': timestamp,
+            'action': f'state:{state}',
+            'actionUser': action_user,
+            'instanceId': instance_id,
+            'createdAt': datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+        }
+        self.table.put_item(Item=item)
+        logger.info(f"Logged state transition: {state} for {instance_id} at {timestamp}")
+
+    def query_state_history(self, instance_id, since_epoch=None, limit=200):
+        """
+        Return start/stop transition events for an instance, newest first.
+
+        Args:
+            instance_id: EC2 instance ID
+            since_epoch: Optional Unix epoch lower bound (inclusive)
+            limit: Max events to return
+
+        Returns:
+            list of {timestamp, state, actionUser} dicts (newest first)
+        """
+        key_cond = Key('id').eq(instance_id)
+        if since_epoch is not None:
+            key_cond = key_cond & Key('timestamp').gte(int(since_epoch))
+
+        events = []
+        kwargs = {
+            'KeyConditionExpression': key_cond,
+            'ScanIndexForward': False,  # newest first
+            'Limit': limit
+        }
+        resp = self.table.query(**kwargs)
+        for item in resp.get('Items', []):
+            action = item.get('action', '')
+            if not action.startswith('state:'):
+                continue
+            events.append({
+                'timestamp': int(item['timestamp']),
+                'state': action.split(':', 1)[1],
+                'actionUser': item.get('actionUser', 'external')
+            })
+        return events
+
+    @staticmethod
+    def compute_running_seconds(events, now_epoch):
+        """
+        Compute total running seconds from a list of state events.
+
+        Pairs each 'running' with the next 'stopped' (chronologically). If the
+        instance is currently running (last event is 'running'), counts up to now.
+
+        Args:
+            events: list from query_state_history (any order; sorted internally)
+            now_epoch: current Unix epoch for open-ended running periods
+
+        Returns:
+            int total running seconds
+        """
+        ordered = sorted(events, key=lambda e: e['timestamp'])
+        total = 0
+        running_since = None
+        for e in ordered:
+            if e['state'] == 'running' and running_since is None:
+                running_since = e['timestamp']
+            elif e['state'] == 'stopped' and running_since is not None:
+                total += max(0, e['timestamp'] - running_since)
+                running_since = None
+        if running_since is not None:
+            total += max(0, int(now_epoch) - running_since)
+        return total
 
 # Backward compatibility aliases
 Dyn = CoreTableDyn

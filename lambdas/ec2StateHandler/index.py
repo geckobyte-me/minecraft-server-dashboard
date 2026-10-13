@@ -33,6 +33,7 @@ cognito_pool_id = os.getenv('COGNITO_USER_POOL_ID', None)
 utl = utilHelper.Utils()
 ec2_utils = ec2Helper.Ec2Utils()
 ddb = ddbHelper.CoreTableDyn(servers_table_name)
+audit_table = ddbHelper.LogAuditTable()
 utc = pytz.utc
 pst = pytz.timezone('US/Pacific')
 
@@ -69,7 +70,6 @@ mutation PutServerMetric($input: ServerMetricInput!) {
         memStats
         cpuStats
         networkStats
-        activeUsers
     }
 }
 """
@@ -87,9 +87,7 @@ changeServerState = """
       diskSize
       launchTime
       publicIp
-      initStatus
       iamStatus
-      runningMinutes
     }
 }
 """
@@ -131,10 +129,9 @@ def schedule_event_response():
     for instance in instances_running["Instances"]:
         instance_info = {
             'id': instance["InstanceId"],
-            'memStats': utl.get_metrics_data(instance["InstanceId"], 'MinecraftDashboard', 'mem_usage', 'Percent', 'Average', dt_start_time, dt_now, 60),
-            'cpuStats': utl.get_metrics_data(instance["InstanceId"], 'MinecraftDashboard', 'cpu_usage', 'Percent', 'Average', dt_start_time, dt_now, 60),
-            'networkStats': utl.get_metrics_data(instance["InstanceId"], 'MinecraftDashboard', 'transmit_bandwidth', 'Bytes/Second', 'Sum', dt_start_time, dt_now, 60),
-            'activeUsers': utl.get_metrics_data(instance["InstanceId"], 'MinecraftDashboard', 'user_count', 'Count', 'Maximum', dt_start_time, dt_now, 60)
+            'memStats': utl.get_metrics_data(instance["InstanceId"], 'CWAgent', 'mem_used_percent', 'Percent', 'Average', dt_start_time, dt_now, 60),
+            'cpuStats': utl.get_metrics_data(instance["InstanceId"], 'CWAgent', 'cpu_usage_active', 'Percent', 'Average', dt_start_time, dt_now, 60),
+            'networkStats': utl.get_metrics_data(instance["InstanceId"], 'AWS/EC2', 'NetworkOut', 'Bytes', 'Average', dt_start_time, dt_now, 60)
         }
         instances_payload.append(instance_info)
 
@@ -237,21 +234,15 @@ def state_change_response(instance_id):
     # Converting to PST as the logs are in PST        
     pstLaunchTime = launchTime.astimezone(pst)
 
-    # Get cached running minutes with timestamp
-    runtime_data = ec2_utils.get_cached_running_minutes(instance_id)
-    
     # building payload
     input = {
         "id": instance_id,
         "name": instanceName,
         "type": instance_info["InstanceType"],
         "state": instance_info["State"]["Name"].lower(),
-        "initStatus": ec2Status["initStatus"].lower(),
         "iamStatus": ec2Status["iamStatus"].lower(),
         "launchTime": pstLaunchTime.strftime("%m/%d/%Y - %H:%M:%S"),
-        "publicIp": publicIp,
-        "runningMinutes": runtime_data['minutes'],
-        "runningMinutesCacheTimestamp": runtime_data.get('timestamp', '')
+        "publicIp": publicIp
     }
     
     # Only include userEmail if it exists and is valid
@@ -260,6 +251,18 @@ def state_change_response(instance_id):
 
     return input
     
+def _event_epoch(event):
+    """Return the EventBridge event time as Unix epoch seconds (fallback: now)."""
+    event_time = event.get('time')
+    if event_time:
+        try:
+            # EventBridge 'time' is ISO8601, e.g. 2026-10-13T14:02:11Z
+            dt = datetime.fromisoformat(event_time.replace('Z', '+00:00'))
+            return int(dt.timestamp())
+        except Exception as e:
+            logger.warning(f"Could not parse event time '{event_time}': {e}")
+    return int(datetime.now(tz=timezone.utc).timestamp())
+
 def handle_instance_state_change(event):
     """Handle EC2 Instance State-change Notification events."""
     if not scheduled_event_bridge_rule:
@@ -275,7 +278,17 @@ def handle_instance_state_change(event):
         manage_scheduled_rule(increment=True)
     elif state == "stopped":
         manage_scheduled_rule(increment=False)
-    
+
+    # Record running/stopped transitions for uptime history. This fires for
+    # every origin (app, console, CLI, alarm, schedule) since it's driven by the
+    # EC2 state-change event, not the app. Attribution is best-effort 'external'.
+    if state in ("running", "stopped"):
+        try:
+            event_epoch = _event_epoch(event)
+            audit_table.log_state_transition(instance_id, state, event_epoch, action_user='external')
+        except Exception as e:
+            logger.error(f"Failed to log state transition for {instance_id}: {e}")
+
     # Send state change notification
     input_data = state_change_response(instance_id)
     if not input_data:

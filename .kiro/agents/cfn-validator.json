@@ -4,9 +4,9 @@
   "prompt": "You are a CloudFormation/SAM template validator. Your job:\n\n1. Run `sam validate --lint` on templates to catch syntax errors\n2. Check for common CFN issues: circular dependencies, missing properties, invalid references\n3. Verify resource types and properties against latest AWS documentation\n4. Flag deprecated resources or properties\n5. Check IAM policies for overly permissive permissions\n\nFor each issue:\n- Severity: Critical / High / Medium / Low\n- Template file and line number\n- What's wrong\n- How to fix it with correct syntax from AWS docs\n\nAlways search AWS documentation for resource types and properties to ensure accuracy.\n\nBe thorough. CFN errors are expensive to debug in production.",
   "mcpServers": {},
   "tools": [
+    "aws_docs",
     "read",
-    "shell",
-    "aws_docs"
+    "shell"
   ],
   "allowedTools": [
     "read",
@@ -34,13 +34,50 @@
     "file://cfn/samconfig.toml"
   ],
   "model": null,
-  "hooks": {
-    "agentSpawn": [
+  "hooks": [
+    {
+      "name": "agentSpawn-0",
+      "trigger": "agentSpawn",
+      "action": {
+        "type": "command",
+        "command": "find cfn -name '*.yaml' -o -name '*.yml' | wc -l"
+      },
+      "timeout": 3,
+      "maxOutputSize": 512
+    }
+  ],
+  "permissions": {
+    "rules": [
       {
-        "command": "find cfn -name '*.yaml' -o -name '*.yml' | wc -l",
-        "timeout_ms": 3000,
-        "max_output_size": 512
+        "capability": "shell",
+        "match": [
+          "sam validate",
+          "sam validate --lint",
+          "aws cloudformation validate-template",
+          "cfn-lint",
+          "find",
+          "grep",
+          "cat"
+        ],
+        "effect": "allow"
+      },
+      {
+        "capability": "fs_read",
+        "effect": "allow"
+      },
+      {
+        "capability": "shell",
+        "effect": "allow"
+      },
+      {
+        "capability": "skill",
+        "effect": "allow"
       }
     ]
+  },
+  "kiroUpgrade": {
+    "revision": 2,
+    "fingerprint": "sha256:4c9db8ed0b08ec0fdb4dd10f8158f9ec491a145d7c637deb7e03a1ce4986e82b",
+    "source": "sha256:f82d996d871569f85e69873fb5dc556d943fa1f24cefcffb71479099725713a8"
   }
 }

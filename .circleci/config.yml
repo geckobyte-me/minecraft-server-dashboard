@@ -9,14 +9,12 @@ workflows:
   dev-pipeline:
     jobs:
       - build-and-deploy-backend:
-          context: dev-aws
           name: deploy-backend-dev
           stage: dev
           filters:
             branches:
               ignore: main
       - build-and-deploy-frontend:
-          context: dev-aws
           name: deploy-frontend-dev
           stage: dev
           requires:
@@ -24,19 +22,17 @@ workflows:
           filters:
             branches:
               ignore: main
-              
+
   # Production pipeline - runs only on main branch
   prod-pipeline:
     jobs:
       - build-and-deploy-backend:
-          context: prod-aws
           name: deploy-backend-prod
           stage: prod
           filters:
             branches:
               only: main
       - build-and-deploy-frontend:
-          context: prod-aws
           name: deploy-frontend-prod
           stage: prod
           requires:
@@ -44,6 +40,44 @@ workflows:
           filters:
             branches:
               only: main
+
+commands:
+  resolve-stage-env:
+    description: >
+      Resolve per-stage environment variables into fixed names used by the
+      rest of the job. AWS_ROLE_ARN_<STAGE> is required (OIDC role to assume);
+      ARTIFACTS_BUCKET_<STAGE> is optional and falls back to a derived name.
+    parameters:
+      stage:
+        type: string
+    steps:
+      - run:
+          name: Resolve stage environment
+          command: |
+            set -euo pipefail
+            STAGE="<< parameters.stage >>"
+            STAGE_UPPER=$(echo "$STAGE" | tr '[:lower:]' '[:upper:]')
+
+            # Required: OIDC role ARN for this stage. Fail fast if unset.
+            ROLE_VAR="AWS_ROLE_ARN_${STAGE_UPPER}"
+            ROLE_ARN="${!ROLE_VAR:-}"
+            if [ -z "$ROLE_ARN" ]; then
+              echo "ERROR: $ROLE_VAR is not set. Configure the per-stage OIDC role ARN in CircleCI project/context settings."
+              exit 1
+            fi
+
+            # Optional: artifacts bucket; fall back to the plumbing-stack naming convention.
+            BUCKET_VAR="ARTIFACTS_BUCKET_${STAGE_UPPER}"
+            ARTIFACTS_BUCKET="${!BUCKET_VAR:-msd-artifacts-circleci-${STAGE}}"
+
+            echo "export AWS_ROLE_ARN='${ROLE_ARN}'" >> "$BASH_ENV"
+            echo "export ARTIFACTS_BUCKET='${ARTIFACTS_BUCKET}'" >> "$BASH_ENV"
+            echo "export STACK_NAME='msd-${STAGE}'" >> "$BASH_ENV"
+
+            echo "Stage:            ${STAGE}"
+            echo "Role ARN:         ${ROLE_ARN}"
+            echo "Artifacts bucket: ${ARTIFACTS_BUCKET}"
+            echo "Stack name:       msd-${STAGE}"
 
 jobs:
   build-and-deploy-backend:
@@ -61,26 +95,23 @@ jobs:
             - sam-cache-v2-{{ .Branch }}-{{ checksum "cfn/template.yaml" }}
             - sam-cache-v2-{{ .Branch }}-
             - sam-cache-v2-
-      - aws-cli/setup
+      - resolve-stage-env:
+          stage: << parameters.stage >>
+      - aws-cli/setup:
+          role_arn: "$AWS_ROLE_ARN"
+          role_session_name: "circleci-msd-<< parameters.stage >>-backend"
+          region: AWS_DEFAULT_REGION
       - aws-sam/install
       - run:
-          name: Setup Rust
+          name: Ensure artifacts bucket exists
           command: |
-            echo "Rust files changed, setting up Rust toolchain"
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            source $HOME/.cargo/env
-            rustup target add x86_64-unknown-linux-musl
-            sudo apt-get update
-            sudo apt-get install -y musl-tools
-      - run:
-          name: Setup Python for SAM build
-          command: |
-            # Find the actual Python binary and create a symlink
-            PYTHON_PATH=$(find ~/.pyenv/versions -name "python3.13" -type f 2>/dev/null | head -1)
-            if [ -n "$PYTHON_PATH" ]; then
-              sudo ln -sf "$PYTHON_PATH" /usr/local/bin/python3.13
-              echo "Created symlink: /usr/local/bin/python3.13 -> $PYTHON_PATH"
-            fi
+            set -euo pipefail
+            # Deploy (idempotent) the CI plumbing stack that owns the artifacts bucket.
+            aws cloudformation deploy \
+              --stack-name "msd-circleci-<< parameters.stage >>" \
+              --template-file cfn/msd-circleci-stack.yaml \
+              --parameter-overrides "ProjectName=msd" "EnvironmentName=<< parameters.stage >>" \
+              --no-fail-on-empty-changeset
       - run:
           name: Validate SAM template
           command: |
@@ -90,7 +121,6 @@ jobs:
             sam validate --template-file templates/ec2.yaml --lint
             sam validate --template-file templates/dynamodb.yaml --lint
             sam validate --template-file templates/cognito.yaml --lint
-            sam validate --template-file templates/ssm.yaml --lint
             sam validate --template-file templates/web.yaml --lint
       - run:
           name: Build SAM application
@@ -107,16 +137,14 @@ jobs:
           command: |
             set -e
             cd cfn
-            
-            STACK_NAME="msd-<< parameters.stage >>"
-            
-            # Check if stack exists and is in failed state
-            STACK_STATUS=$(aws cloudformation describe-stacks --stack-name $STACK_NAME --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
-            
+
+            # Check if stack exists and is in a failed state
+            STACK_STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "DOES_NOT_EXIST")
+
             if [[ "$STACK_STATUS" == "UPDATE_ROLLBACK_FAILED" ]]; then
               echo "Stack is in UPDATE_ROLLBACK_FAILED state. Attempting to continue rollback..."
-              aws cloudformation continue-update-rollback --stack-name $STACK_NAME
-              aws cloudformation wait stack-rollback-complete --stack-name $STACK_NAME
+              aws cloudformation continue-update-rollback --stack-name "$STACK_NAME"
+              aws cloudformation wait stack-rollback-complete --stack-name "$STACK_NAME"
               echo "Rollback completed successfully"
             elif [[ "$STACK_STATUS" == "ROLLBACK_COMPLETE" ]]; then
               echo "ERROR: Stack is in ROLLBACK_COMPLETE state."
@@ -125,104 +153,47 @@ jobs:
               echo "  2. Fix the issue and redeploy"
               exit 1
             fi
-            
-            # Deploy with monitoring
+
             export AWS_S3_USE_ARN_REGION=false
-            
-            # Set bucket names based on stage
-            if [ "<< parameters.stage >>" = "dev" ]; then
-              SUPPORT_BUCKET="${ARTIFACTS_BUCKET_DEV}"
-              FRONTEND_BUCKET="${FRONTEND_BUCKET_DEV}"
-            elif [ "<< parameters.stage >>" = "prod" ]; then
-              SUPPORT_BUCKET="${ARTIFACTS_BUCKET_PROD}"
-              FRONTEND_BUCKET="${FRONTEND_BUCKET_PROD}"
-            fi
-            
+
             sam deploy \
-              --stack-name $STACK_NAME \
-              --config-env << parameters.stage >> \
+              --stack-name "$STACK_NAME" \
               --resolve-s3 \
               --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
-              --parameter-overrides "ProjectName=msd EnvironmentName=<< parameters.stage >> AppValue=minecraft SupportBucketName=$SUPPORT_BUCKET FrontendBucketName=$FRONTEND_BUCKET" \
+              --parameter-overrides "ProjectName=msd EnvironmentName=<< parameters.stage >> AppValue=minecraft SupportBucketName=$ARTIFACTS_BUCKET" \
               --no-confirm-changeset \
               --no-fail-on-empty-changeset \
               --disable-rollback &
-            
+
             DEPLOY_PID=$!
-            
+
             # Monitor stack events while deployment runs
             echo "Monitoring CloudFormation deployment progress..."
             while kill -0 $DEPLOY_PID 2>/dev/null; do
               aws cloudformation describe-stack-events \
-                --stack-name $STACK_NAME \
+                --stack-name "$STACK_NAME" \
                 --query 'StackEvents[0:5].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]' \
                 --output table 2>/dev/null || true
               sleep 60
             done
-            
-            # Wait for deployment to complete and get exit code
+
+            # Wait for deployment to complete and surface its exit code
             wait $DEPLOY_PID
       - run:
           name: Get stack outputs
           command: |
-            cd cfn
             aws cloudformation describe-stacks \
-              --stack-name msd-<< parameters.stage >> \
+              --stack-name "$STACK_NAME" \
               --query 'Stacks[0].Outputs' \
               --output table
       - run:
-          name: Build Rust binaries
-          command: |
-            echo "Building Rust binaries"
-            source $HOME/.cargo/env
-            cd rust/msd-metrics
-            cargo build --release --target x86_64-unknown-linux-musl
-            cp target/x86_64-unknown-linux-musl/release/msd-metrics ../../
-            
-            cd ../msd-logs
-            cargo build --release --target x86_64-unknown-linux-musl
-            cp target/x86_64-unknown-linux-musl/release/msd-logs ../../
-      - run:
-          name: Upload Rust binaries and scripts to SupportBucket
-          command: |
-            # Get bucket name from CloudFormation stack outputs
-            SUPPORT_BUCKET=$(aws cloudformation describe-stacks \
-              --stack-name msd-<< parameters.stage >> \
-              --query 'Stacks[0].Outputs[?OutputKey==`SupportBucket`].OutputValue' \
-              --output text)
-            
-            echo "Using support bucket: $SUPPORT_BUCKET"
-            
-            # Get script version
-            SCRIPT_VERSION=$(cat scripts/VERSION)
-            echo "Script version: $SCRIPT_VERSION"
-            
-            echo "Uploading Rust binaries to s3://$SUPPORT_BUCKET/"
-            aws s3 cp msd-metrics "s3://$SUPPORT_BUCKET/msd-metrics"
-            aws s3 cp msd-logs "s3://$SUPPORT_BUCKET/msd-logs"
-            
-            echo "Uploading bootstrap scripts to s3://$SUPPORT_BUCKET/scripts/v${SCRIPT_VERSION}/"
-            if [ -d "scripts" ]; then
-              aws s3 sync scripts/ "s3://$SUPPORT_BUCKET/scripts/v${SCRIPT_VERSION}/" --delete
-            fi
-            
-            # Also upload to 'latest' for convenience
-            echo "Uploading to s3://$SUPPORT_BUCKET/scripts/latest/"
-            aws s3 sync scripts/ "s3://$SUPPORT_BUCKET/scripts/latest/" --delete
-      - run:
           name: Upload CloudWatch agent config
           command: |
-            # Get bucket name from CloudFormation stack outputs
-            SUPPORT_BUCKET=$(aws cloudformation describe-stacks \
-              --stack-name msd-<< parameters.stage >> \
-              --query 'Stacks[0].Outputs[?OutputKey==`SupportBucket`].OutputValue' \
-              --output text)
-            
-            if [ -f "amazon-cloudwatch-agent.json" ]; then
-              echo "Uploading CloudWatch agent config to s3://$SUPPORT_BUCKET/"
-              aws s3 cp amazon-cloudwatch-agent.json "s3://$SUPPORT_BUCKET/amazon-cloudwatch-agent.json"
+            set -euo pipefail
+            if [ -f "cloudwatch/amazon-cloudwatch-agent.json" ]; then
+              echo "Uploading CloudWatch agent config to s3://$ARTIFACTS_BUCKET/"
+              aws s3 cp cloudwatch/amazon-cloudwatch-agent.json "s3://$ARTIFACTS_BUCKET/amazon-cloudwatch-agent.json"
             fi
-
       - save_cache:
           key: sam-cache-v2-{{ .Branch }}-{{ checksum "cfn/template.yaml" }}
           paths:
@@ -243,14 +214,18 @@ jobs:
           keys:
             - npm-cache-{{ .Branch }}-{{ checksum "webapp/package-lock.json" }}
             - npm-cache-{{ .Branch }}-
-      - aws-cli/setup
+      - resolve-stage-env:
+          stage: << parameters.stage >>
+      - aws-cli/setup:
+          role_arn: "$AWS_ROLE_ARN"
+          role_session_name: "circleci-msd-<< parameters.stage >>-frontend"
+          region: AWS_DEFAULT_REGION
       - run:
-          name: Get stack configuration
+          name: Generate .env from stack outputs
           command: |
             set -e
-            # Run create-env-from-cfn-stack.sh to generate .env file
             chmod +x support_tasks/create-env-from-cfn-stack.sh
-            ./support_tasks/create-env-from-cfn-stack.sh msd-<< parameters.stage >> ${AWS_DEFAULT_REGION}
+            ./support_tasks/create-env-from-cfn-stack.sh "$STACK_NAME" "${AWS_DEFAULT_REGION}"
       - run:
           name: Build frontend
           command: |
@@ -261,24 +236,31 @@ jobs:
       - run:
           name: Deploy to S3 and invalidate CloudFront
           command: |
-            set -e
-            
-            # Use environment variables from CircleCI project settings
-            if [ "<< parameters.stage >>" = "dev" ]; then
-              BUCKET_NAME="${FRONTEND_BUCKET_DEV}"
-              CLOUDFRONT_ID="${CLOUDFRONT_DISTRIBUTION_DEV}"
-            elif [ "<< parameters.stage >>" = "prod" ]; then
-              BUCKET_NAME="${FRONTEND_BUCKET_PROD}"
-              CLOUDFRONT_ID="${CLOUDFRONT_DISTRIBUTION_PROD}"
+            set -euo pipefail
+
+            # Resolve the frontend bucket + CloudFront distribution from the app
+            # stack outputs (created by cfn/templates/web.yaml).
+            BUCKET_NAME=$(aws cloudformation describe-stacks \
+              --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[?OutputKey=='WebAppBucket'].OutputValue" \
+              --output text)
+            CLOUDFRONT_ID=$(aws cloudformation describe-stacks \
+              --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[?OutputKey=='CloudFront'].OutputValue" \
+              --output text)
+
+            if [ -z "$BUCKET_NAME" ] || [ "$BUCKET_NAME" = "None" ]; then
+              echo "ERROR: Could not resolve WebAppBucket from stack $STACK_NAME outputs."
+              exit 1
             fi
-            
+
             echo "Deploying to S3 bucket: $BUCKET_NAME"
-            aws s3 sync webapp/dist/ s3://$BUCKET_NAME --delete
-            
-            if [ -n "$CLOUDFRONT_ID" ]; then
+            aws s3 sync webapp/dist/ "s3://$BUCKET_NAME" --delete
+
+            if [ -n "$CLOUDFRONT_ID" ] && [ "$CLOUDFRONT_ID" != "None" ]; then
               echo "Invalidating CloudFront distribution: $CLOUDFRONT_ID"
               aws cloudfront create-invalidation \
-                --distribution-id $CLOUDFRONT_ID \
+                --distribution-id "$CLOUDFRONT_ID" \
                 --paths "/*"
             fi
       - save_cache:

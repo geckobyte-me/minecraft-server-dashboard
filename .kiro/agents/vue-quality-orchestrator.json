@@ -40,13 +40,52 @@
     "file://webapp/eslint.config.js"
   ],
   "model": null,
-  "hooks": {
-    "agentSpawn": [
+  "hooks": [
+    {
+      "name": "agentSpawn-0",
+      "trigger": "agentSpawn",
+      "action": {
+        "type": "command",
+        "command": "git ls-files 'webapp/*.vue' 'webapp/*.js' 'webapp/*.ts' | wc -l"
+      },
+      "timeout": 3,
+      "maxOutputSize": 512
+    }
+  ],
+  "permissions": {
+    "rules": [
       {
-        "command": "git ls-files 'webapp/*.vue' 'webapp/*.js' 'webapp/*.ts' | wc -l",
-        "timeout_ms": 3000,
-        "max_output_size": 512
+        "capability": "shell",
+        "match": [
+          "find webapp",
+          "git diff",
+          "git ls-files",
+          "wc",
+          "cat"
+        ],
+        "effect": "allow"
+      },
+      {
+        "capability": "fs_read",
+        "effect": "allow"
+      },
+      {
+        "capability": "shell",
+        "effect": "allow"
+      },
+      {
+        "capability": "subagent",
+        "effect": "allow"
+      },
+      {
+        "capability": "skill",
+        "effect": "allow"
       }
     ]
+  },
+  "kiroUpgrade": {
+    "revision": 2,
+    "fingerprint": "sha256:9ed53e7422c7e168d4747fa819d6758db925a94962a9fb05545d71191d56011b",
+    "source": "sha256:a7f9a2847e05cbb5b2da3a8e1fc2b4e7ff98f88d7652239239841f98218241ae"
   }
 }

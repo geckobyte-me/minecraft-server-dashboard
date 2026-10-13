@@ -14,10 +14,10 @@
     }
   },
   "tools": [
-    "read",
     "code",
     "grep",
-    "mcp:cloudwatch"
+    "mcp:cloudwatch",
+    "read"
   ],
   "allowedTools": [
     "read",
@@ -31,5 +31,22 @@
     "file://lambdas/**/*.py",
     "file://layers/**/*.py"
   ],
-  "model": null
+  "model": null,
+  "permissions": {
+    "rules": [
+      {
+        "capability": "fs_read",
+        "effect": "allow"
+      },
+      {
+        "capability": "skill",
+        "effect": "allow"
+      }
+    ]
+  },
+  "kiroUpgrade": {
+    "revision": 2,
+    "fingerprint": "sha256:c3b415a61068966133114f99f1e4c5c7ae7e89549742463584cf6e57724d32f0",
+    "source": "sha256:b50d256df6e1c0fef5fb3a61743d97e97587eae950db0298aae209601ff8dad8"
+  }
 }

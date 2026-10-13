@@ -14,21 +14,13 @@ export const ec2Discovery = /* GraphQL */ `
       diskSize
       launchTime
       publicIp
-      initStatus
       iamStatus
-      runningMinutes
-      runningMinutesCacheTimestamp
-      configStatus
-      configValid
-      configWarnings
-      configErrors
-      autoConfigured
     }
   }
 `;
-export const getLoginAudit = /* GraphQL */ `
-  query GetLoginAudit($id: ID!) {
-    getLoginAudit(id: $id) {
+export const getLogAudit = /* GraphQL */ `
+  query GetLogAudit($id: ID!) {
+    getLogAudit(id: $id) {
       id
       actionUser
       action
@@ -38,43 +30,20 @@ export const getLoginAudit = /* GraphQL */ `
     }
   }
 `;
-export const listLoginAudits = /* GraphQL */ `
-  query ListLoginAudits(
-    $filter: ModelLoginAuditFilterInput
-    $limit: Int
-    $nextToken: String
-  ) {
-    listLoginAudits(filter: $filter, limit: $limit, nextToken: $nextToken) {
-      items {
-        id
-        email
-        action
-        expirationEpoch
-        createdAt
-        updatedAt
-      }
-      nextToken
-    }
-  }
-`;
 
 export const getServerConfig = /* GraphQL */ `
 query GetServerConfig($id: String!) {
   getServerConfig(id: $id) {
     id
-    runCommand
-    workDir
     stopScheduleExpression
     startScheduleExpression
+    alarmMetric
     alarmThreshold
     alarmEvaluationPeriod
     timezone
-    isBootstrapComplete
-    minecraftVersion
-    latestPatchUpdate
+    hasCognitoGroup
     createdAt
     updatedAt
-    autoConfigured
   }
 }
 `;
@@ -109,19 +78,6 @@ export const searchUserByEmail = /* GraphQL */ `
   }
 `;
 
-export const getec2ActionValidatorStatus = /* GraphQL */ `
-  query Getec2ActionValidatorStatus($id: String!) {
-    getec2ActionValidatorStatus(id: $id) {
-      id
-      action
-      status
-      timestamp
-      message
-      userEmail
-    }
-  }
-`;
-
 export const ec2MetricsHandler = /* GraphQL */ `
   query ec2MetricsHandler($id: String!) {
     ec2MetricsHandler(id: $id) {
@@ -129,18 +85,23 @@ export const ec2MetricsHandler = /* GraphQL */ `
       cpuStats
       networkStats
       memStats
-      activeUsers
     }
   }
 `;
 
-export const GET_SERVER_LOGS = `
-  query GetServerLogs($instanceId: String!, $lines: Int) {
-    getServerLogs(instanceId: $instanceId, lines: $lines) {
-      success
-      logs
-      error
-      instanceId
+export const getServerUptime = /* GraphQL */ `
+  query GetServerUptime($instanceId: String!, $days: Int) {
+    getServerUptime(instanceId: $instanceId, days: $days) {
+      id
+      state
+      currentSessionSeconds
+      totalRunningSeconds
+      windowDays
+      events {
+        timestamp
+        state
+        actionUser
+      }
     }
   }
 `;

@@ -8,244 +8,326 @@ import authHelper
 import ec2Helper
 import utilHelper
 import ddbHelper
-# from errorHandler import ErrorHandler
+from datetime import datetime
+import pytz
+from aws_croniter import AwsCroniter
+from botocore.session import Session
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+from botocore.httpsession import URLLib3Session
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 ec2_client = boto3.client('ec2')
-sqs_client = boto3.client('sqs')
+eventbridge_client = boto3.client('events')
 
 appValue = os.getenv('TAG_APP_VALUE')
+appName = os.getenv('APP_NAME')
+envName = os.getenv('ENVIRONMENT_NAME')
 ec2_instance_profile_name = os.getenv('EC2_INSTANCE_PROFILE_NAME')
 ec2_instance_profile_arn = os.getenv('EC2_INSTANCE_PROFILE_ARN')
 cognito_pool_id = os.getenv('COGNITO_USER_POOL_ID')
-server_action_queue_url = os.getenv('SERVER_ACTION_QUEUE_URL')
+endpoint = os.getenv('APPSYNC_URL', None)
 
 auth = authHelper.Auth(cognito_pool_id)
 ec2_utils = ec2Helper.Ec2Utils()
 utl = utilHelper.Utils()
 core_dyn = ddbHelper.CoreTableDyn()
+audit_table = ddbHelper.LogAuditTable()
+
+_boto3_session = boto3.Session()
+aws_region = _boto3_session.region_name
+account_id = boto3.client('sts').get_caller_identity()['Account']
 
 
 def send_status_to_appsync(action, instance_id, status, message=None, user_email=None):
     """
-    Log action status for monitoring and debugging.
-    Note: Status updates are not persisted to DynamoDB.
-    Future: Could broadcast via subscription for real-time UI updates.
-    
+    Send action status to AppSync via the putec2ActionValidatorStatus mutation
+    so the frontend receives it over the onPutec2ActionValidatorStatus subscription.
+
     Args:
         action: Action being performed
         instance_id: EC2 instance ID
         status: Status of the action (PROCESSING, COMPLETED, FAILED)
         message: Optional status message
         user_email: Email of user who initiated the action
-        
+
     Returns:
-        bool: Always returns True (logging only)
+        bool: True if the status was accepted by AppSync
     """
     logger.info(f"Action status: action={action}, instance={instance_id}, status={status}, user={user_email}, message={message}")
-    
-    return True
+
+    if not endpoint:
+        logger.warning("AppSync endpoint not configured; skipping status broadcast")
+        return False
+
+    mutation = """
+    mutation Putec2ActionValidatorStatus($input: ec2ActionValidatorStatusInput!) {
+        putec2ActionValidatorStatus(input: $input) {
+            id
+            action
+            status
+            message
+            timestamp
+        }
+    }
+    """
+    variables = {
+        "input": {
+            "id": instance_id,
+            "action": action,
+            "status": status,
+            "message": message or "",
+            "userEmail": user_email or "",
+            "timestamp": int(time.time())
+        }
+    }
+    payload = {"query": mutation, "variables": variables}
+
+    try:
+        credentials = Session().get_credentials()
+        request = AWSRequest(
+            method='POST',
+            url=endpoint,
+            data=json.dumps(payload),
+            headers={'Content-Type': 'application/json'}
+        )
+        SigV4Auth(credentials, 'appsync', aws_region).add_auth(request)
+        response = URLLib3Session().send(request.prepare())
+        if response.status_code == 200:
+            return True
+        logger.error(f"AppSync status request failed: {response.status_code} - {response.content}")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to send status to AppSync: {str(e)}")
+        return False
             
 def _is_valid_cron(cron_expression):
-    """
-    Basic validation for cron expressions (5-field format)
-    
-    Args:
-        cron_expression: String containing cron expression
-        
-    Returns:
-        bool: True if valid format, False otherwise
-    """
+    """Basic validation for 5-field cron expressions."""
     if not cron_expression or not isinstance(cron_expression, str):
         return False
-    
     parts = cron_expression.strip().split()
     if len(parts) != 5:
         return False
-    
-    # Basic pattern check - allows numbers, ranges, wildcards, lists
     cron_pattern = r'^[0-9*,/-]+$'
     return all(re.match(cron_pattern, part) for part in parts)
 
-def validate_create_server_input(input_data):
-    """
-    Validate server creation parameters
-    
-    Args:
-        input_data: Dictionary containing server creation parameters
-        
-    Returns:
-        tuple: (is_valid, error_message)
-    """
-    # Server name validation
-    server_name = input_data.get('serverName', '').strip()
-    if not server_name or len(server_name) < 3 or len(server_name) > 50:
-        return False, "Server name must be 3-50 characters"
-    
-    if not re.match(r'^[a-zA-Z0-9_-]+$', server_name):
-        return False, "Server name can only contain alphanumeric characters, hyphens, and underscores"
-    
-    # Instance type validation
-    instance_type = input_data.get('instanceType')
-    allowed_types = ['t3.micro', 't3.small', 't3.medium', 't3.large', 't3.xlarge', 't3.2xlarge']
-    if instance_type not in allowed_types:
-        return False, f"Instance type must be one of {allowed_types}"
-    
-    # Shutdown method validation
-    shutdown_method = input_data.get('shutdownMethod')
-    if shutdown_method not in ['CPUUtilization', 'Connections', 'Schedule']:
-        return False, "Invalid shutdown method"
-    
-    # Threshold validation for CPU and Connection based shutdown
-    if shutdown_method in ['CPUUtilization', 'Connections']:
-        threshold = input_data.get('alarmThreshold')
-        if threshold is None or threshold < 0 or threshold > 100:
-            return False, "Threshold must be between 0 and 100"
-        
-        eval_period = input_data.get('alarmEvaluationPeriod')
-        if eval_period is None or eval_period < 1 or eval_period > 60:
-            return False, "Evaluation period must be between 1 and 60 minutes"
-    
-    # Schedule validation
-    if shutdown_method == 'Schedule':
-        start_schedule = input_data.get('startScheduleExpression', '').strip()
-        stop_schedule = input_data.get('stopScheduleExpression', '').strip()
-        
-        if not start_schedule or not stop_schedule:
-            return False, "Both start and stop schedules required for scheduled shutdown"
-        
-        # Validate cron format (basic check)
-        if not utl.is_valid_cron(start_schedule) or not utl.is_valid_cron(stop_schedule):
-            return False, "Invalid cron expression format"
-    
-    return True, None
 
-def validate_queue_message(action, instance_id, arguments=None, user_email=None):
-    """
-    Validate message before sending to queue
-    
-    Args:
-        action: Action to perform (required)
-        instance_id: EC2 instance ID (required)
-        arguments: Optional arguments for the action
-        user_email: Email of user initiating the action (optional)
-        
-    Returns:
-        tuple: (is_valid, error_message)
-    """
-    # Validate required fields
-    if not action or not isinstance(action, str) or not action.strip():
-        return False, "Action is required and must be a non-empty string"
-    
-    if not instance_id or not isinstance(instance_id, str) or not instance_id.strip():
-        return False, "Instance ID is required and must be a non-empty string"
-    
-    # Validate action is one of the allowed types
-    allowed_actions = [
-        'start', 'stop', 'restart',
-        'startServer', 'stopServer', 'restartServer',
-        'putServerConfig', 'putserverconfig',
-        'updateServerConfig', 'updateserverconfig',
-        'updateServerName', 'updateservername',
-        'createServer', 'createserver'
-    ]
-    if action.lower() not in [a.lower() for a in allowed_actions]:
-        return False, f"Invalid action: {action}. Must be one of {allowed_actions}"
-    
-    # Validate optional fields if provided
-    if arguments is not None and not isinstance(arguments, dict):
-        return False, "Arguments must be a dictionary if provided"
-    
-    if user_email is not None and (not isinstance(user_email, str) or not user_email.strip()):
-        return False, "User email must be a non-empty string if provided"
-    
-    return True, None
+# ============================================================================
+# Synchronous action execution (start/stop)
+# ============================================================================
 
-def send_to_queue(action, instance_id, arguments=None, user_email=None):
-    """
-    Send action to SQS queue for async processing and send initial PROCESSING status to AppSync
-    
-    Args:
-        action: Action to perform (start, stop, restart, etc.)
-        instance_id: EC2 instance ID
-        arguments: Optional arguments for the action
-        user_email: Email of user initiating the action
-        
-    Returns:
-        dict: Response with 202 status if successful, 400 for validation errors, 500 if failed
-    """
-    logger.info(f"Queue operation initiated: action={action}, instance={instance_id}, user={user_email}")
-    
-    if not server_action_queue_url:
-        logger.error(f"Queue operation FAILED: No queue URL configured for action={action}, instance={instance_id}")
-        return utl.response(500, {"err": "Queue not configured"})
-    
-    # Validate message before sending
-    is_valid, error_message = validate_queue_message(action, instance_id, arguments, user_email)
-    if not is_valid:
-        logger.error(f"Queue operation FAILED: Message validation failed for action={action}, instance={instance_id}, error={error_message}")
-        return utl.response(400, {"err": error_message})
-    
-    # Build message with all required fields
-    message = {
-        'action': action,
-        'instanceId': instance_id,
-        'timestamp': int(time.time())
+def _execute_ec2_action(action, instance_id):
+    """Execute an EC2 start/stop call."""
+    actions = {
+        'start': lambda: ec2_client.start_instances(InstanceIds=[instance_id]),
+        'stop': lambda: ec2_client.stop_instances(InstanceIds=[instance_id]),
     }
-    
-    # Include optional fields only if provided
-    if arguments is not None:
-        message['arguments'] = arguments
-    
-    if user_email is not None:
-        message['userEmail'] = user_email
-    
-    logger.info(f"Queue operation: Sending message to SQS - action={action}, instance={instance_id}, queue={server_action_queue_url}")
-    
     try:
-        # Send message to SQS queue
-        response = sqs_client.send_message(
-            QueueUrl=server_action_queue_url,
-            MessageBody=json.dumps(message)
-        )
-        message_id = response.get('MessageId', 'unknown')
-        logger.info(f"Queue operation SUCCESS: Message sent to SQS - action={action}, instance={instance_id}, messageId={message_id}")
-        
-        # Send initial PROCESSING status to AppSync
-        logger.info(f"Sending initial PROCESSING status to AppSync: action={action}, instance={instance_id}")
-        status_sent = send_status_to_appsync(
-            action=action,
-            instance_id=instance_id,
-            status="PROCESSING",
-            message=f"{action.capitalize()} request queued for processing",
-            user_email=user_email
-        )
-        
-        if status_sent:
-            logger.info(f"Initial status update SUCCESS: action={action}, instance={instance_id}")
-        else:
-            logger.warning(f"Initial status update FAILED: action={action}, instance={instance_id}")
-        
-        return utl.response(202, {"msg": f"{action.capitalize()} request queued for processing"})
+        actions[action]()
+        return True
     except Exception as e:
-        logger.error(f"Queue operation FAILED with exception: action={action}, instance={instance_id}, error={str(e)}", exc_info=True)
-        return utl.response(500, {"err": "Failed to queue action"})
+        logger.error(f"EC2 {action} failed: {str(e)}")
+        return False
 
-def action_process_sync(action, instance_id, arguments=None):
-    """Synchronous processing for read-only operations"""
-    logger.info("Action: %s InstanceId: %s", action, instance_id)
-    action = action.lower().strip()
 
-    # Only handle read-only operations synchronously
-    if action == "getserverconfig":
-        return handle_get_server_config(instance_id)
-    elif action == "getserverusers":
-        return handle_get_server_users(instance_id)
+def handle_server_action(action, instance_id, action_user='system'):
+    """Start or stop an EC2 instance, with state validation and audit logging."""
+    logger.info(f"Handling {action} for {instance_id}")
+
+    server_info = core_dyn.get_server_info(instance_id)
+    instance = ec2_utils.list_server_by_id(instance_id)
+    if not instance or not instance.get('Instances'):
+        logger.error(f"Instance not found: {instance_id}")
+        return False
+
+    state = instance['Instances'][0]["State"]["Name"]
+    server_name = (server_info or {}).get('name', instance_id)
+
+    valid_states = {'start': 'stopped', 'stop': 'running'}
+    if state != valid_states.get(action):
+        logger.warning(f"Cannot {action} instance in state {state}")
+        return False
+
+    if not _execute_ec2_action(action, instance_id):
+        return False
+
+    try:
+        audit_table.log_action(
+            instance_id=instance_id,
+            action=action,
+            action_user=action_user,
+            metadata={'serverName': server_name, 'previousState': state}
+        )
+    except Exception as e:
+        logger.warning(f"Audit log failed for {action} on {instance_id}: {str(e)}")
+
+    logger.info(f"{action.capitalize()} initiated for {instance_id}")
+    return True
+
+
+# ============================================================================
+# Auto-shutdown alarm configuration (CPU or Network)
+# ============================================================================
+
+def _configure_alarm_shutdown(instance_id, arguments):
+    """Create/update or remove the CloudWatch auto-shutdown alarm."""
+    alarm_threshold = arguments.get('alarmThreshold', 0)
+    alarm_period = arguments.get('alarmEvaluationPeriod', 10) or 10
+    # alarmMetric: "CPUUtilization" (default) or "NetworkOut"
+    alarm_metric = arguments.get('alarmMetric') or 'CPUUtilization'
+
+    if alarm_threshold and alarm_threshold > 0:
+        ec2_utils.update_alarm(instance_id, alarm_metric, alarm_threshold, alarm_period)
     else:
-        # All other actions should be queued
-        return send_to_queue(action, instance_id, arguments)
+        ec2_utils.remove_alarm(instance_id)
+
+
+# ============================================================================
+# Scheduled start/stop (EventBridge) configuration
+# ============================================================================
+
+def _convert_timezone_to_utc(hour, minute, timezone_name):
+    """Convert local time to UTC based on timezone."""
+    if not timezone_name or timezone_name == 'UTC':
+        return hour, minute
+    try:
+        tz = pytz.timezone(timezone_name)
+        now = datetime.now()
+        local_time = tz.localize(datetime(now.year, now.month, now.day, int(hour), int(minute)))
+        utc_time = local_time.astimezone(pytz.UTC)
+        return str(utc_time.hour), str(utc_time.minute)
+    except Exception as e:
+        logger.error(f"Error converting timezone {timezone_name} to UTC: {e}")
+        return hour, minute
+
+
+def _format_schedule_expression(cron_expression, timezone_name='UTC'):
+    """Format a 5-field cron expression into an EventBridge cron() expression (UTC)."""
+    if not cron_expression:
+        return None
+    cron_expression = cron_expression.strip()
+
+    if cron_expression.startswith('cron(') and cron_expression.endswith(')'):
+        cron_content = cron_expression[5:-1]
+        try:
+            AwsCroniter(cron_content)
+            return cron_expression
+        except Exception as e:
+            logger.error(f"Invalid EventBridge cron expression: {e}")
+            return None
+
+    fields = cron_expression.split()
+    if len(fields) != 5:
+        return None
+
+    minute, hour, day, month, day_of_week = fields
+
+    if timezone_name and timezone_name != 'UTC':
+        hour, minute = _convert_timezone_to_utc(hour, minute, timezone_name)
+
+    # Convert day-of-week from standard (0=Sun) to EventBridge (1=Sun)
+    if day_of_week != '*' and day_of_week != '?':
+        dow_parts = []
+        for part in day_of_week.split(','):
+            part = part.strip()
+            dow_parts.append(str(int(part) + 1) if part.isdigit() else part)
+        day_of_week = ','.join(dow_parts)
+
+    # EventBridge requires '?' for one of day-of-month / day-of-week
+    if day_of_week == '*' and day == '*':
+        day = '?'
+    elif day_of_week != '*' and day_of_week != '?':
+        day = '?'
+
+    eb_cron = f"{minute} {hour} {day} {month} {day_of_week} *"
+    try:
+        AwsCroniter(eb_cron)
+        return f"cron({eb_cron})"
+    except Exception as e:
+        logger.error(f"Invalid cron expression after conversion: {e}")
+        return None
+
+
+def _put_schedule_rule(rule_name, target_id, formatted_schedule, action, instance_id):
+    """Create/replace an EventBridge rule that invokes this Lambda to start/stop."""
+    try:
+        existing = eventbridge_client.list_rules(NamePrefix=rule_name)
+        if existing.get('Rules'):
+            eventbridge_client.remove_targets(Rule=rule_name, Ids=[target_id])
+            eventbridge_client.delete_rule(Name=rule_name)
+    except ClientError as e:
+        logger.warning(f"Error removing existing rule {rule_name}: {e}")
+
+    eventbridge_client.put_rule(Name=rule_name, ScheduleExpression=formatted_schedule, State='ENABLED')
+
+    lambda_arn = f"arn:aws:lambda:{aws_region}:{account_id}:function:{appName}-{envName}-ec2ActionValidator"
+    eventbridge_client.put_targets(
+        Rule=rule_name,
+        Targets=[{
+            'Id': target_id,
+            'Arn': lambda_arn,
+            'Input': json.dumps({"action": action, "instanceId": instance_id, "source": f"scheduled-{action}"})
+        }]
+    )
+    logger.info(f"{action} event configured for {instance_id} with schedule {formatted_schedule}")
+
+
+def _remove_schedule_rule(rule_name, target_id):
+    """Remove an EventBridge schedule rule if it exists."""
+    try:
+        if not eventbridge_client.list_rules(NamePrefix=rule_name).get('Rules'):
+            return
+        eventbridge_client.remove_targets(Rule=rule_name, Ids=[target_id])
+        eventbridge_client.delete_rule(Name=rule_name)
+        logger.info(f"Removed schedule rule {rule_name}")
+    except ClientError as e:
+        logger.error(f"Error removing schedule rule {rule_name}: {e}")
+
+
+def _configure_schedule_shutdown(instance_id, arguments):
+    """Configure or remove start/stop EventBridge schedules."""
+    timezone_name = arguments.get('timezone', 'UTC')
+
+    stop_schedule = arguments.get('stopScheduleExpression')
+    if stop_schedule:
+        formatted = _format_schedule_expression(stop_schedule, timezone_name)
+        if not formatted:
+            raise ValueError(f"Invalid stop cron expression: {stop_schedule}")
+        _put_schedule_rule(f"shutdown-{instance_id}", f"shutdown-target-{instance_id}", formatted, "stopServer", instance_id)
+    else:
+        _remove_schedule_rule(f"shutdown-{instance_id}", f"shutdown-target-{instance_id}")
+
+    start_schedule = arguments.get('startScheduleExpression')
+    if start_schedule:
+        formatted = _format_schedule_expression(start_schedule, timezone_name)
+        if not formatted:
+            raise ValueError(f"Invalid start cron expression: {start_schedule}")
+        _put_schedule_rule(f"start-{instance_id}", f"start-target-{instance_id}", formatted, "startServer", instance_id)
+    else:
+        _remove_schedule_rule(f"start-{instance_id}", f"start-target-{instance_id}")
+
+
+def handle_update_server_config(instance_id, arguments):
+    """Persist config and apply alarm + schedule shutdown settings."""
+    logger.info(f"Updating config for {instance_id}")
+    if not arguments:
+        logger.error("Missing arguments for config update")
+        return False
+    try:
+        if 'id' not in arguments:
+            arguments['id'] = instance_id
+        core_dyn.put_server_config(arguments)
+        _configure_alarm_shutdown(instance_id, arguments)
+        _configure_schedule_shutdown(instance_id, arguments)
+        logger.info(f"Config updated successfully for {instance_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Config update failed for {instance_id}: {str(e)}", exc_info=True)
+        return False
+
 
 def handle_get_server_users(instance_id):
     """
@@ -346,96 +428,39 @@ def handle_search_user_by_email(email):
             "message": f"An error occurred while searching for user: {str(e)}"
         })
 
-def handle_create_server(input_data, user_attributes):
-    """
-    Handle server creation request
-    
-    Args:
-        input_data: Dictionary containing server creation parameters
-        user_attributes: User information from JWT token
-        
-    Returns:
-        dict: Response with appropriate status code and body
-    """
-    try:
-        logger.info(f"Server creation request: user={user_attributes.get('email', 'unknown')}, data={input_data}")
-        
-        # Check if user is admin
-        cognito_groups = user_attributes.get('cognito:groups', [])
-        admin_group_name = os.getenv('ADMIN_GROUP_NAME', 'admin')
-        
-        if admin_group_name not in cognito_groups:
-            logger.warning(f"Non-admin user attempted server creation: user={user_attributes.get('email', 'unknown')}, groups={cognito_groups}")
-            return utl.response(403, {"err": "Only admin users can create servers"})
-        
-        logger.info(f"Admin authorization confirmed: user={user_attributes.get('email', 'unknown')}")
-        
-        # Validate input parameters
-        is_valid, error_message = validate_create_server_input(input_data)
-        if not is_valid:
-            logger.error(f"Server creation validation failed: user={user_attributes.get('email', 'unknown')}, error={error_message}")
-            return utl.response(400, {"err": error_message})
-        
-        logger.info(f"Server creation validation passed: user={user_attributes.get('email', 'unknown')}")
-        
-        # Prepare SQS message with all required parameters
-        message_data = {
-            'action': 'createServer',
-            'serverName': input_data['serverName'],
-            'instanceType': input_data['instanceType'],
-            'shutdownMethod': input_data['shutdownMethod'],
-            'userEmail': user_attributes.get('email'),
-            'timestamp': int(time.time())
-        }
-        
-        # Add optional parameters if provided
-        if 'alarmThreshold' in input_data:
-            message_data['alarmThreshold'] = input_data['alarmThreshold']
-        
-        if 'alarmEvaluationPeriod' in input_data:
-            message_data['alarmEvaluationPeriod'] = input_data['alarmEvaluationPeriod']
-        
-        if 'startScheduleExpression' in input_data:
-            message_data['startScheduleExpression'] = input_data['startScheduleExpression']
-        
-        if 'stopScheduleExpression' in input_data:
-            message_data['stopScheduleExpression'] = input_data['stopScheduleExpression']
-        
-        logger.info(f"Queuing server creation: user={user_attributes.get('email', 'unknown')}, server={input_data['serverName']}")
-        
-        # Send to SQS queue
-        if not server_action_queue_url:
-            logger.error("Server creation FAILED: No queue URL configured")
-            return utl.response(500, {"err": "Queue not configured"})
-        
-        try:
-            response = sqs_client.send_message(
-                QueueUrl=server_action_queue_url,
-                MessageBody=json.dumps(message_data)
-            )
-            message_id = response.get('MessageId', 'unknown')
-            logger.info(f"Server creation queued successfully: messageId={message_id}, server={input_data['serverName']}")
-            
-            # Send initial PROCESSING status
-            send_status_to_appsync(
-                action='createServer',
-                instance_id='pending',  # No instance ID yet
-                status='PROCESSING',
-                message="Server creation request queued for processing",
-                user_email=user_attributes.get('email')
-            )
-            
-            return utl.response(202, {"msg": "Server creation request queued for processing"})
-            
-        except Exception as e:
-            logger.error(f"Server creation queue FAILED: user={user_attributes.get('email', 'unknown')}, error={str(e)}", exc_info=True)
-            return utl.response(500, {"err": "Failed to queue server creation request"})
-    
-    except Exception as e:
-        logger.error(f"Server creation FAILED with exception: user={user_attributes.get('email', 'unknown')}, error={str(e)}", exc_info=True)
-        return utl.response(500, {"err": "Server creation request failed"})
+def action_process_sync(action, instance_id, arguments=None, user_email='system'):
+    """Execute an action synchronously (read-only queries and write actions)."""
+    logger.info("Action: %s InstanceId: %s", action, instance_id)
+    action = action.lower().strip()
 
-def handle_add_user_to_server(instance_id, user_email, user_attributes):
+    # Read-only operations
+    if action in ("getserverconfig",):
+        return handle_get_server_config(instance_id)
+    if action in ("getserverusers",):
+        return handle_get_server_users(instance_id)
+
+    # Start / stop
+    if action in ("start", "startserver"):
+        send_status_to_appsync("start", instance_id, "PROCESSING", "Starting server", user_email)
+        ok = handle_server_action("start", instance_id, user_email)
+        send_status_to_appsync("start", instance_id, "COMPLETED" if ok else "FAILED",
+                               "Server starting" if ok else "Failed to start server", user_email)
+        return utl.response(200 if ok else 500, {"msg" if ok else "err": "start"})
+
+    if action in ("stop", "stopserver"):
+        send_status_to_appsync("stop", instance_id, "PROCESSING", "Stopping server", user_email)
+        ok = handle_server_action("stop", instance_id, user_email)
+        send_status_to_appsync("stop", instance_id, "COMPLETED" if ok else "FAILED",
+                               "Server stopping" if ok else "Failed to stop server", user_email)
+        return utl.response(200 if ok else 500, {"msg" if ok else "err": "stop"})
+
+    # Config (alarm + schedule)
+    if action in ("putserverconfig", "updateserverconfig"):
+        ok = handle_update_server_config(instance_id, arguments)
+        return utl.response(200 if ok else 500, {"msg" if ok else "err": "config"})
+
+    logger.error(f"Unknown action: {action}")
+    return utl.response(400, {"err": f"Unknown action: {action}"})
     """
     Helper function to add a user to a server using DynamoDB membership with default viewer role
     
@@ -662,60 +687,59 @@ def handle_remove_user_from_server(instance_id, user_id, requesting_user_attribu
         return None
         #return ErrorHandler.create_error_response(500, 'INTERNAL_ERROR', error=f"An unexpected error occurred: {str(e)}")
 
-def handle_get_server_config_old(instance_id):
-    """Helper function to handle get server config action"""
-    try:
+def handle_get_server_uptime(instance_id, days=30):
+    """Return start/stop history plus computed uptime for an instance.
 
-        server_config = core_dyn.get_server_config(instance_id)
-        if server_config is None:
-            logger.warning(f"No config found for instance {instance_id}, returning empty config")
-            # Return empty config structure matching GraphQL schema
-            return {
-                'id': instance_id,
-                'shutdownMethod': '',
-                'stopScheduleExpression': '',
-                'startScheduleExpression': '',
-                'alarmThreshold': 0.0,
-                'alarmEvaluationPeriod': 0,
-                'runCommand': '',
-                'workDir': '',
-                'timezone': 'UTC',
-                'isBootstrapComplete': False,
-                'hasCognitoGroup': False,
-                'minecraftVersion': '',
-                'latestPatchUpdate': '',
-                'runningMinutesCache': None,
-                'runningMinutesCacheTimestamp': ''
-            }
-        return server_config
+    Reads 'state:*' transition rows (written by ec2StateHandler for all
+    origins) from the audit table, computes current-session and total running
+    seconds over the requested window.
+    """
+    try:
+        now_epoch = int(time.time())
+        days = days if (days and days > 0) else 30
+        since_epoch = now_epoch - days * 86400
+
+        events = audit_table.query_state_history(instance_id, since_epoch=since_epoch, limit=500)
+        total_seconds = audit_table.compute_running_seconds(events, now_epoch)
+
+        # Current state + current-session uptime from the newest event
+        current_state = None
+        current_session_seconds = 0
+        if events:
+            newest = events[0]  # query returns newest first
+            current_state = newest['state']
+            if newest['state'] == 'running':
+                current_session_seconds = max(0, now_epoch - newest['timestamp'])
+
+        return {
+            'id': instance_id,
+            'state': current_state,
+            'currentSessionSeconds': current_session_seconds,
+            'totalRunningSeconds': total_seconds,
+            'windowDays': days,
+            'events': events
+        }
     except Exception as e:
-        logger.error(f"Error getting server config for {instance_id}: {str(e)}", exc_info=True)
-        return utl.response(500, {"error": f"Failed to get server config: {str(e)}"})
+        logger.error(f"Error getting uptime for {instance_id}: {str(e)}", exc_info=True)
+        return utl.response(500, {"error": f"Failed to get uptime: {str(e)}"})
 
 def handle_get_server_config(instance_id):
     """Helper function to handle get server config action"""
     try:
-        
+
         server_config = core_dyn.get_server_config(instance_id)
         if server_config is None:
             logger.warning(f"No config found for instance {instance_id}, returning empty config")
             # Return empty config structure matching GraphQL schema
             return {
                 'id': instance_id,
-                'shutdownMethod': '',
                 'stopScheduleExpression': '',
                 'startScheduleExpression': '',
+                'alarmMetric': 'CPUUtilization',
                 'alarmThreshold': 0.0,
                 'alarmEvaluationPeriod': 0,
-                'runCommand': '',
-                'workDir': '',
                 'timezone': 'UTC',
-                'isBootstrapComplete': False,
-                'hasCognitoGroup': False,
-                'minecraftVersion': '',
-                'latestPatchUpdate': '',
-                'runningMinutesCache': None,
-                'runningMinutesCacheTimestamp': ''
+                'hasCognitoGroup': False
             }
         return server_config
     except Exception as e:
@@ -723,8 +747,8 @@ def handle_get_server_config(instance_id):
         return utl.response(500, {"error": f"Failed to get server config: {str(e)}"})
 
 def handle_local_invocation(event, context):
-    # Handle local invocations here
-    return action_process_sync(event["action"], event["instanceId"])
+    # Scheduled EventBridge invocations (start/stop) run as 'system'
+    return action_process_sync(event["action"], event["instanceId"], user_email='system')
 
 def handle_search_user_by_email_operation(event):
     """Handle searchUserByEmail operation."""
@@ -732,13 +756,6 @@ def handle_search_user_by_email_operation(event):
     if not email:
         return utl.response(400, {"err": "email is required"})
     return handle_search_user_by_email(email)
-
-def handle_create_server_operation(event, user_attributes):
-    """Handle createServer operation."""
-    input_data = event["arguments"].get("input")
-    if not input_data:
-        return utl.response(400, {"err": "input is required for createServer"})
-    return handle_create_server(input_data, user_attributes)
 
 def route_instance_operation(event, instance_id, user_attributes):
     """Route operations that require instance authorization with role-based permissions."""
@@ -767,7 +784,12 @@ def route_instance_operation(event, instance_id, user_attributes):
     
     # Read-only operations
     if field_name in ["getserverconfig", "getserverusers"]:
-        return action_process_sync(field_name, instance_id, input_data)
+        return action_process_sync(field_name, instance_id, input_data, user_attributes["email"])
+
+    # Uptime history (read-only)
+    if field_name == "getserveruptime":
+        days = event["arguments"].get("days") or 30
+        return handle_get_server_uptime(instance_id, days)
     
     # Add user operation - create DynamoDB membership with default viewer role
     if field_name == "addusertoserver":
@@ -776,7 +798,7 @@ def route_instance_operation(event, instance_id, user_attributes):
             return utl.response(400, {"err": "userEmail is required"})
         return handle_add_user_to_server(instance_id, user_email, user_attributes)
     
-    # Update user role operation - new DynamoDB-based role management
+    # Update user role operation
     if field_name == "updateuserrole":
         user_id = event["arguments"].get("userId")
         new_role = event["arguments"].get("role")
@@ -784,40 +806,22 @@ def route_instance_operation(event, instance_id, user_attributes):
             return utl.response(400, {"err": "userId and role are required"})
         return handle_update_user_role(instance_id, user_id, new_role, user_attributes)
     
-    # Remove user from server operation - new DynamoDB-based user removal
+    # Remove user from server operation
     if field_name == "removeuserfromserver":
         user_id = event["arguments"].get("userId")
         if not user_id:
             return utl.response(400, {"err": "userId is required"})
         return handle_remove_user_from_server(instance_id, user_id, user_attributes)
     
-    # Update server name
-    if field_name == "updateservername":
-        new_name = event["arguments"].get("newName")
-        if not new_name:
-            return utl.response(400, {"err": "newName is required"})
-        
-        new_name = new_name.strip()
-        if not new_name:
-            return utl.response(400, {"err": "Server name cannot be empty"})
-        if len(new_name) > 255:
-            return utl.response(400, {"err": "Server name cannot exceed 255 characters"})
-        
-        return send_to_queue("updateServerName", instance_id, {"newName": new_name}, user_attributes["email"])
-    
-    # Config operations
+    # Config operations (synchronous): persist + apply alarm/schedule, return config data
     if field_name in ["putserverconfig", "updateserverconfig"]:
-        queue_response = send_to_queue(field_name, instance_id, input_data, user_attributes["email"])
-        
-        if queue_response.get('statusCode') == 202:
-            logger.info(f"Config queued successfully, returning config data: instance={instance_id}")
+        result = action_process_sync(field_name, instance_id, input_data, user_attributes["email"])
+        if isinstance(result, dict) and result.get('statusCode') == 200:
             return input_data
-        else:
-            logger.error(f"Config queuing failed: instance={instance_id}, response={queue_response}")
-            return queue_response
+        return result
     
-    # All other write operations
-    return send_to_queue(field_name, instance_id, input_data, user_attributes["email"])
+    # Start / stop (synchronous)
+    return action_process_sync(field_name, instance_id, input_data, user_attributes["email"])
 
 def handler(event, context):
     """
@@ -860,9 +864,6 @@ def handler(event, context):
         
         if field_name == "getadminusers":
             return handle_get_admin_users()
-        
-        if field_name == "createserver":
-            return handle_create_server_operation(event, user_attributes)
         
         # Extract instance ID for regular operations
         instance_id = ec2Helper.extract_instance_id(event)

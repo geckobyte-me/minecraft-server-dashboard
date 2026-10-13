@@ -6,20 +6,13 @@
         <div class="stat-value">{{ online }}<span class="stat-total">/{{ total }}</span></div>
       </div>
     </v-col>
-    <v-col cols="12" sm="6">
-      <div class="stat-card">
-        <div class="stat-label">Active Players</div>
-        <div class="stat-value">{{ players }}</div>
-      </div>
-    </v-col>
   </v-row>
 </template>
 
 <script setup>
 defineProps({
   online: { type: Number, default: 3 },
-  total: { type: Number, default: 5 },
-  players: { type: Number, default: 42 }
+  total: { type: Number, default: 5 }
 })
 </script>
 
