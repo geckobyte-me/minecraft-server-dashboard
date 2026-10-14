@@ -82,7 +82,7 @@ commands:
 jobs:
   build-and-deploy-backend:
     docker:
-      - image: cimg/python:3.13
+      - image: cimg/python:3.14
     parameters:
       stage:
         type: string
@@ -90,6 +90,25 @@ jobs:
       AWS_DEFAULT_REGION: us-west-2
     steps:
       - checkout
+      - run:
+          name: Resolve real Python path for SAM make-based layer builds
+          command: |
+            # SAM's CustomMakeBuilder runs the layer Makefiles in a shell where
+            # the pyenv shim can't resolve its own helpers (pyenv-version-name:
+            # command not found). Resolve the concrete interpreter path once and
+            # export it as PYTHON so the Makefiles bypass the shim entirely.
+            PY_VERSION=$(pyenv versions --bare | grep '^3\.14' | tail -1)
+            if [ -z "$PY_VERSION" ]; then
+              echo "ERROR: No pyenv 3.14.x found on the image."
+              pyenv versions
+              exit 1
+            fi
+            pyenv global "$PY_VERSION"
+            pyenv rehash
+            REAL_PYTHON=$(pyenv which python3)
+            echo "Using interpreter: $REAL_PYTHON"
+            "$REAL_PYTHON" --version
+            echo "export PYTHON='${REAL_PYTHON}'" >> "$BASH_ENV"
       - restore_cache:
           keys:
             - sam-cache-v2-{{ .Branch }}-{{ checksum "cfn/template.yaml" }}
