@@ -300,6 +300,7 @@ Resources:
   ScheduledRule:
     Type: AWS::Events::Rule
     Properties:
+      Name: !Sub "${ProjectName}-${EnvironmentName}-ec2StateScheduledRule"
       Description: "ScheduledRule"
       ScheduleExpression: "rate(2 minutes)"
       State: "DISABLED"
@@ -307,14 +308,6 @@ Resources:
         -
           Arn: !GetAtt ec2StateHandler.Arn
           Id: "ec2StateHandlerV1"
-
-  ScheduledRuleParameter:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub /${ProjectName}/${EnvironmentName}/scheduledrule
-      Type: String
-      Value: !Ref ScheduledRule
-      Description: ScheduledRule
 
   PermissionForEventsToInvokeLambda:
     Type: AWS::Lambda::Permission
@@ -393,8 +386,6 @@ Resources:
         - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
         - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
         - arn:aws:iam::aws:policy/AmazonCognitoReadOnly
-        - SSMParameterReadPolicy:
-            ParameterName: !Sub "${ProjectName}*"
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -432,6 +423,7 @@ Resources:
                 Fn::ImportValue: !Sub "${ProjectName}-${EnvironmentName}-LogAuditTable"
       Environment:
         Variables:
+          SCHEDULED_RULE_NAME: !Sub "${ProjectName}-${EnvironmentName}-ec2StateScheduledRule"
           APPSYNC_URL: !GetAtt GraphQLAPI.GraphQLUrl
           COGNITO_USER_POOL_ID:
             Fn::ImportValue: !Sub "${ProjectName}-${EnvironmentName}-UserPoolId"
@@ -467,8 +459,6 @@ Resources:
         - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
         - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
         - arn:aws:iam::aws:policy/AmazonCognitoReadOnly
-        - SSMParameterReadPolicy:
-            ParameterName: !Sub "${ProjectName}*"
         - Version: "2012-10-17"
           Statement:
             - Effect: Allow
@@ -495,8 +485,6 @@ Resources:
         - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
         - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
         - arn:aws:iam::aws:policy/AmazonCognitoReadOnly
-        - SSMParameterReadPolicy:
-            ParameterName: !Sub "${ProjectName}*"
         - Version: "2012-10-17"
           Statement:
             - Effect: Allow
@@ -592,8 +580,6 @@ Resources:
         - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
         - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
         - arn:aws:iam::aws:policy/AmazonCognitoReadOnly
-        - SSMParameterReadPolicy:
-            ParameterName: !Sub "${ProjectName}*"
         - Version: "2012-10-17"
           Statement:
             - Effect: Allow

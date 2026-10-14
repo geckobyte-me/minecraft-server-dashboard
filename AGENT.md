@@ -112,20 +112,55 @@ Two DynamoDB tables (`cfn/templates/dynamodb.yaml`):
 - **CoreTable** — single-table design, `PK`/`SK` with a `SK-PK-index` GSI. Holds server metadata/config (`PK: SERVER#{id}`, `SK: METADATA`) and user membership records (`PK: USER#{sub}`, `SK: SERVER#{id}`). Prefer Query over Scan.
 - **LogAudit** — key `id` (instanceId, HASH) + `timestamp` (epoch, RANGE). Holds app action audit rows and `state:*` transition rows used for uptime.
 
+## Pre-Deploy Prerequisites (manual, one-time)
+
+These must exist in the target AWS account **before** `sam deploy`, or the stacks fail at create:
+
+- **Google OAuth SSM parameters** — the Cognito stack (`cfn/templates/cognito.yaml`) resolves the Google identity provider credentials from SSM at deploy time via `{{resolve:ssm:...}}`. Create both as plain `String` parameters (the template uses `resolve:ssm`, not `resolve:ssm-secure`). The paths are **not** stage-scoped — dev and prod share them in a single account:
+  ```bash
+  aws ssm put-parameter --name "/minecraft/GOOGLE_CLIENT_ID" --type String \
+    --value "<google-oauth-client-id>"  --description "Google OAuth client ID (Cognito)"
+  aws ssm put-parameter --name "/minecraft/GOOGLE_SECRET"    --type String \
+    --value "<google-oauth-client-secret>" --description "Google OAuth client secret (Cognito)"
+  ```
+  Get the client ID/secret from a Google Cloud OAuth 2.0 client. Add the Cognito domain's
+  callback URL as an authorized redirect URI in the Google console.
+
+- **CircleCI OIDC deploy roles** — one IAM role per stage, assumed by the pipeline via OIDC
+  (`AWS_ROLE_ARN_DEV` / `AWS_ROLE_ARN_PROD`).
+
+The artifacts/support bucket is **not** a manual prerequisite — the backend pipeline deploys
+`cfn/msd-circleci-stack.yaml` (idempotent) to create `msd-artifacts-circleci-<stage>` before the
+app deploy. The frontend bucket + CloudFront are created by the app stack (`WebStack` → `web.yaml`).
+
 ## Deployment (CircleCI)
 
-- **dev-pipeline**: all branches except `main`, uses `dev-aws` context.
-- **prod-pipeline**: `main` only, uses `prod-aws` context.
+Single AWS account, OIDC auth (no static credentials / no `dev-aws`/`prod-aws` contexts).
 
-Backend job (`cimg/python:3.13`): validate templates → `sam build` → `sam deploy` → upload the CloudWatch agent config to S3.
-Frontend job (`cimg/node:20.18`, requires backend): generate `.env` from stack outputs (`support_tasks/create-env-from-cfn-stack.sh`) → `npm ci` → `npm run build` → upload `dist/` to S3 → invalidate CloudFront.
+- **dev-pipeline**: all branches except `main`.
+- **prod-pipeline**: `main` only.
+
+Per-stage env vars (CircleCI project settings): `AWS_ROLE_ARN_<STAGE>` (required, OIDC role),
+`ARTIFACTS_BUCKET_<STAGE>` (optional, falls back to `msd-artifacts-circleci-<stage>`).
+`AWS_DEFAULT_REGION` is set in the config (`us-west-2`).
+
+Backend job (`cimg/python:3.14`): resolve real Python onto PATH (pyenv-shim workaround for SAM
+builders) → assume OIDC role → ensure artifacts bucket (`msd-circleci-stack.yaml`) → validate
+templates → `sam build` → `sam deploy` (stack `msd-<stage>`) → upload CloudWatch agent config to the
+artifacts bucket.
+Frontend job (`cimg/node:20.18`, requires backend): assume OIDC role → generate `.env` from stack
+outputs (`support_tasks/create-env-from-cfn-stack.sh`) → `npm ci` → `npm run build` → `s3 sync` to the
+`WebAppBucket` output → invalidate the `CloudFront` output distribution. Frontend bucket + CloudFront
+ID come from stack outputs, not env vars.
+
 
 ## Agent Working Notes
 
 - Lambda functions and layers are both defined in `cfn/templates/lambdas.yaml`; update CloudFormation when adding either.
 - When changing a GraphQL operation, keep `appsync/schema.graphql`, the resolver wiring in `lambdas.yaml`, the Lambda handler, and the frontend `webapp/src/graphql/` files in sync. AppSync rejects response objects containing fields not in the schema — trim Lambda/`ddbHelper` return shapes to match.
 - Start/stop/config run synchronously in `ec2ActionValidator`; there is no SQS worker. Scheduled rules invoke the same Lambda directly.
-- `sam build` in some local environments fails because the layer Makefiles call `/usr/local/bin/python3.13`; CI provides that symlink. Template validation and `py_compile` are reliable local checks.
+- The layer Makefiles build Python deps via `$(PYTHON)` (defaults to `python3`). On pyenv-based CI images, SAM's builders need a real interpreter, not a pyenv shim: the backend job prepends the concrete `python3.14` bin dir to PATH and exports `PYTHON`. Template validation and `py_compile` are reliable local checks.
+- Deploy prerequisites that are NOT in the templates: the `/minecraft/GOOGLE_CLIENT_ID` and `/minecraft/GOOGLE_SECRET` SSM params (see Pre-Deploy Prerequisites) and the CircleCI OIDC roles. A fresh account fails without them.
 - Do not commit secrets. Sensitive config belongs in SSM Parameter Store; frontend values come from CloudFormation outputs via `VITE_`-prefixed env vars.
 - Treat production deploys and destructive AWS operations as high-risk — confirm before acting.
 - Don't add tests unless explicitly requested.

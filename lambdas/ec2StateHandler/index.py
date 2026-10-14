@@ -37,7 +37,7 @@ audit_table = ddbHelper.LogAuditTable()
 utc = pytz.utc
 pst = pytz.timezone('US/Pacific')
 
-scheduled_event_bridge_rule = utl.get_ssm_param(f"/{appName}/{envName}/scheduledrule")
+scheduled_event_bridge_rule = os.environ["SCHEDULED_RULE_NAME"]
 logger.info(f"Scheduled EventBridge Rule: {scheduled_event_bridge_rule}")
 
 # Connection pool for AppSync client
