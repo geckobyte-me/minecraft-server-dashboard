@@ -315,8 +315,7 @@ Resources:
       FunctionName: !Ref "ec2StateHandler"
       Action: "lambda:InvokeFunction"
       Principal: "events.amazonaws.com"
-      SourceArn:
-        !GetAtt ScheduledRule.Arn
+      SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${ProjectName}-${EnvironmentName}-ec2StateScheduledRule"
 
   AuthLayer:
     Type: AWS::Serverless::LayerVersion
