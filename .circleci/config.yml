@@ -91,23 +91,41 @@ jobs:
     steps:
       - checkout
       - run:
-          name: Resolve real Python path for SAM make-based layer builds
+          name: Resolve real Python for SAM builds (layers + functions)
           command: |
-            # SAM's CustomMakeBuilder runs the layer Makefiles in a shell where
-            # the pyenv shim can't resolve its own helpers (pyenv-version-name:
-            # command not found). Resolve the concrete interpreter path once and
-            # export it as PYTHON so the Makefiles bypass the shim entirely.
+            # Two pyenv-shim problems to solve:
+            #  1. The layer Makefiles (CustomMakeBuilder) need a real interpreter
+            #     so the pyenv shim doesn't fail with pyenv-version-name not found.
+            #  2. SAM's built-in PythonPipBuilder (Lambda functions) validates a
+            #     real `python3.14` binary on PATH and rejects/can't-run the pyenv
+            #     shims. We put the concrete version's bin dir at the FRONT of PATH
+            #     so SAM finds the real python3.14 before any shim.
             PY_VERSION=$(pyenv versions --bare | grep '^3\.14' | tail -1)
             if [ -z "$PY_VERSION" ]; then
               echo "ERROR: No pyenv 3.14.x found on the image."
               pyenv versions
               exit 1
             fi
-            pyenv global "$PY_VERSION"
-            pyenv rehash
-            REAL_PYTHON=$(pyenv which python3)
-            echo "Using interpreter: $REAL_PYTHON"
+            PY_BIN_DIR="$(pyenv root)/versions/${PY_VERSION}/bin"
+            if [ ! -x "${PY_BIN_DIR}/python3" ]; then
+              echo "ERROR: expected interpreter not found at ${PY_BIN_DIR}/python3"
+              ls -la "${PY_BIN_DIR}" || true
+              exit 1
+            fi
+            REAL_PYTHON="${PY_BIN_DIR}/python3"
+            echo "Real interpreter: $REAL_PYTHON"
             "$REAL_PYTHON" --version
+
+            # Ensure a python3.14-named binary exists in that dir (SAM looks for
+            # the version-suffixed name).
+            if [ ! -e "${PY_BIN_DIR}/python3.14" ]; then
+              ln -sf "${PY_BIN_DIR}/python3" "${PY_BIN_DIR}/python3.14"
+            fi
+
+            # Prepend the real bin dir to PATH for all later steps (incl. sam build),
+            # so SAM resolves the real interpreter ahead of the pyenv shims.
+            echo "export PATH='${PY_BIN_DIR}:${PATH}'" >> "$BASH_ENV"
+            # For the layer Makefiles.
             echo "export PYTHON='${REAL_PYTHON}'" >> "$BASH_ENV"
       - restore_cache:
           keys:
