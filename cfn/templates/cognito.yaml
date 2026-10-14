@@ -9,6 +9,13 @@ Parameters:
   AppValue:
     Type: String
     Description: Value of the application
+  WebAppUrl:
+    Type: String
+    Default: ""
+    Description: Public URL of the deployed web app (e.g. CloudFront https URL) to register as an OAuth callback/logout URL
+
+Conditions:
+  HasWebAppUrl: !Not [!Equals [!Ref WebAppUrl, ""]]
 
 Resources:
   CognitoUserPool:
@@ -40,9 +47,17 @@ Resources:
       ClientName: !Sub ${ProjectName}-${EnvironmentName}-client
       GenerateSecret: false
       CallbackURLs:
-        - http://localhost:5173/
+        !If
+          - HasWebAppUrl
+          - - http://localhost:5173/
+            - !Ref WebAppUrl
+          - - http://localhost:5173/
       LogoutURLs:
-        - http://localhost:5173/
+        !If
+          - HasWebAppUrl
+          - - http://localhost:5173/
+            - !Ref WebAppUrl
+          - - http://localhost:5173/
       AllowedOAuthFlowsUserPoolClient: true
       ExplicitAuthFlows:
         - ALLOW_CUSTOM_AUTH

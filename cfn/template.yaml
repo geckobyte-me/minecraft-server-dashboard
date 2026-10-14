@@ -35,6 +35,7 @@ Resources:
         ProjectName: !Ref ProjectName
         EnvironmentName: !Ref EnvironmentName
         AppValue: !Ref AppValue
+        WebAppUrl: !Sub "https://${WebStack.Outputs.CloudFrontDomain}/"
 
   WebStack:
     Type: AWS::Serverless::Application

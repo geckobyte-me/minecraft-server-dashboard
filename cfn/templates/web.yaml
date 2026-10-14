@@ -57,7 +57,7 @@ Resources:
       DistributionConfig:
         Origins:
           - Id: S3Origin
-            DomainName: !GetAtt WebAppBucket.DomainName
+            DomainName: !GetAtt WebAppBucket.RegionalDomainName
             S3OriginConfig:
               OriginAccessIdentity: ""
             OriginAccessControlId: !GetAtt OriginAccessControl.Id

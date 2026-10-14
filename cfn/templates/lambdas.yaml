@@ -524,13 +524,20 @@ Resources:
           Statement:
             - Effect: Allow
               Action:
-                - events:PutRule
-                - events:PutTargets
-                - events:DeleteRule
-                - events:RemoveTargets
-                - events:ListRules
-                - events:ListTargetsByRule
-              Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+                - scheduler:CreateSchedule
+                - scheduler:UpdateSchedule
+                - scheduler:DeleteSchedule
+                - scheduler:GetSchedule
+              Resource: !Sub "arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${ProjectName}-${EnvironmentName}/*"
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-${EnvironmentName}-scheduler-exec"
+              Condition:
+                StringEquals:
+                  "iam:PassedToService": scheduler.amazonaws.com
         - Version: "2012-10-17"
           Statement:
             - Effect: Allow
@@ -556,14 +563,50 @@ Resources:
             Fn::ImportValue: !Sub "${ProjectName}-${EnvironmentName}-UserPoolId"
           LOG_AUDIT_TABLE_NAME:
             Fn::ImportValue: !Sub "${ProjectName}-${EnvironmentName}-LogAuditTableName"
+          SCHEDULER_ROLE_ARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-${EnvironmentName}-scheduler-exec"
+          SCHEDULER_GROUP_NAME: !Ref ScheduleGroup
 
-  PermissionForScheduledEventsToInvokeec2ActionValidator:
+  # EventBridge Scheduler group that holds the per-instance start/stop schedules
+  # created at runtime by ec2ActionValidator.
+  ScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub "${ProjectName}-${EnvironmentName}"
+
+  # Execution role assumed by EventBridge Scheduler to invoke ec2ActionValidator
+  # when a start/stop schedule fires.
+  SchedulerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvironmentName}-scheduler-exec"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+      Policies:
+        - PolicyName: invoke-ec2-action-validator
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${EnvironmentName}-ec2ActionValidator"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${EnvironmentName}-ec2ActionValidator:*"
+
+  PermissionForSchedulerToInvokeec2ActionValidator:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref ec2ActionValidator
       Action: "lambda:InvokeFunction"
-      Principal: "events.amazonaws.com"
-      SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+      Principal: "scheduler.amazonaws.com"
+      SourceAccount: !Ref AWS::AccountId
 
   iamProfileManager:
     Type: AWS::Serverless::Function

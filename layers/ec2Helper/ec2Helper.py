@@ -252,23 +252,30 @@ class Ec2Utils:
             return False
     
     def check_eventbridge_rules_exist(self, instance_id):
-        """Check if EventBridge rules exist for the instance.
-           This is a read-only check used by the ec2Discovery Lambda function
+        """Check if EventBridge Scheduler schedules exist for the instance.
+           This is a read-only check used by the ec2Discovery Lambda function.
+           Return keys are kept backward-compatible with the previous
+           EventBridge-rule based implementation.
         """
-        eventbridge = boto3.client('events')
-        shutdown_rule = f"shutdown-{instance_id}"
-        start_rule = f"start-{instance_id}"
-        
+        scheduler = boto3.client('scheduler')
+        group_name = os.getenv('SCHEDULER_GROUP_NAME', 'default')
+        shutdown_schedule = f"shutdown-{instance_id}"
+        start_schedule = f"start-{instance_id}"
+
+        def _exists(name):
+            try:
+                scheduler.get_schedule(Name=name, GroupName=group_name)
+                return True
+            except scheduler.exceptions.ResourceNotFoundException:
+                return False
+
         try:
-            rules = eventbridge.list_rules()
-            rule_names = [rule['Name'] for rule in rules['Rules']]
-            
             return {
-                'shutdown_rule_exists': shutdown_rule in rule_names,
-                'start_rule_exists': start_rule in rule_names
+                'shutdown_rule_exists': _exists(shutdown_schedule),
+                'start_rule_exists': _exists(start_schedule)
             }
         except Exception as e:
-            logger.error(f"Error checking EventBridge rules for {instance_id}: {e}")
+            logger.error(f"Error checking EventBridge schedules for {instance_id}: {e}")
             return {'shutdown_rule_exists': False, 'start_rule_exists': False}
 
     def get_cached_running_minutes(self, instance_id):

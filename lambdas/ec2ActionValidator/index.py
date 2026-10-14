@@ -8,8 +8,6 @@ import authHelper
 import ec2Helper
 import utilHelper
 import ddbHelper
-from datetime import datetime
-import pytz
 from aws_croniter import AwsCroniter
 from botocore.session import Session
 from botocore.auth import SigV4Auth
@@ -21,7 +19,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 ec2_client = boto3.client('ec2')
-eventbridge_client = boto3.client('events')
+scheduler_client = boto3.client('scheduler')
 
 appValue = os.getenv('TAG_APP_VALUE')
 appName = os.getenv('APP_NAME')
@@ -30,6 +28,8 @@ ec2_instance_profile_name = os.getenv('EC2_INSTANCE_PROFILE_NAME')
 ec2_instance_profile_arn = os.getenv('EC2_INSTANCE_PROFILE_ARN')
 cognito_pool_id = os.getenv('COGNITO_USER_POOL_ID')
 endpoint = os.getenv('APPSYNC_URL', None)
+scheduler_role_arn = os.getenv('SCHEDULER_ROLE_ARN')
+scheduler_group_name = os.getenv('SCHEDULER_GROUP_NAME', 'default')
 
 auth = authHelper.Auth(cognito_pool_id)
 ec2_utils = ec2Helper.Ec2Utils()
@@ -186,26 +186,20 @@ def _configure_alarm_shutdown(instance_id, arguments):
 
 
 # ============================================================================
-# Scheduled start/stop (EventBridge) configuration
+# Scheduled start/stop (EventBridge Scheduler) configuration
 # ============================================================================
 
-def _convert_timezone_to_utc(hour, minute, timezone_name):
-    """Convert local time to UTC based on timezone."""
-    if not timezone_name or timezone_name == 'UTC':
-        return hour, minute
-    try:
-        tz = pytz.timezone(timezone_name)
-        now = datetime.now()
-        local_time = tz.localize(datetime(now.year, now.month, now.day, int(hour), int(minute)))
-        utc_time = local_time.astimezone(pytz.UTC)
-        return str(utc_time.hour), str(utc_time.minute)
-    except Exception as e:
-        logger.error(f"Error converting timezone {timezone_name} to UTC: {e}")
-        return hour, minute
+def _format_schedule_expression(cron_expression):
+    """Normalize a 5-field standard cron into an EventBridge Scheduler cron() expression.
 
+    Timezone handling is delegated to EventBridge Scheduler via the
+    ScheduleExpressionTimezone parameter, so no manual UTC conversion is done
+    here (this also keeps the schedule correct across DST transitions).
 
-def _format_schedule_expression(cron_expression, timezone_name='UTC'):
-    """Format a 5-field cron expression into an EventBridge cron() expression (UTC)."""
+    Accepts either an already-formed ``cron(...)`` expression or a 5-field
+    standard cron string (minute hour day-of-month month day-of-week).
+    Returns a ``cron(...)`` string, or ``None`` if invalid.
+    """
     if not cron_expression:
         return None
     cron_expression = cron_expression.strip()
@@ -224,9 +218,6 @@ def _format_schedule_expression(cron_expression, timezone_name='UTC'):
         return None
 
     minute, hour, day, month, day_of_week = fields
-
-    if timezone_name and timezone_name != 'UTC':
-        hour, minute = _convert_timezone_to_utc(hour, minute, timezone_name)
 
     # Convert day-of-week from standard (0=Sun) to EventBridge (1=Sun)
     if day_of_week != '*' and day_of_week != '?':
@@ -251,63 +242,66 @@ def _format_schedule_expression(cron_expression, timezone_name='UTC'):
         return None
 
 
-def _put_schedule_rule(rule_name, target_id, formatted_schedule, action, instance_id):
-    """Create/replace an EventBridge rule that invokes this Lambda to start/stop."""
-    try:
-        existing = eventbridge_client.list_rules(NamePrefix=rule_name)
-        if existing.get('Rules'):
-            eventbridge_client.remove_targets(Rule=rule_name, Ids=[target_id])
-            eventbridge_client.delete_rule(Name=rule_name)
-    except ClientError as e:
-        logger.warning(f"Error removing existing rule {rule_name}: {e}")
-
-    eventbridge_client.put_rule(Name=rule_name, ScheduleExpression=formatted_schedule, State='ENABLED')
-
+def _put_schedule(schedule_name, formatted_schedule, timezone_name, action, instance_id):
+    """Create or update an EventBridge Scheduler schedule that invokes this
+    Lambda to start/stop the instance."""
     lambda_arn = f"arn:aws:lambda:{aws_region}:{account_id}:function:{appName}-{envName}-ec2ActionValidator"
-    eventbridge_client.put_targets(
-        Rule=rule_name,
-        Targets=[{
-            'Id': target_id,
-            'Arn': lambda_arn,
-            'Input': json.dumps({"action": action, "instanceId": instance_id, "source": f"scheduled-{action}"})
-        }]
-    )
-    logger.info(f"{action} event configured for {instance_id} with schedule {formatted_schedule}")
-
-
-def _remove_schedule_rule(rule_name, target_id):
-    """Remove an EventBridge schedule rule if it exists."""
+    target = {
+        'Arn': lambda_arn,
+        'RoleArn': scheduler_role_arn,
+        'Input': json.dumps({"action": action, "instanceId": instance_id, "source": f"scheduled-{action}"})
+    }
+    params = {
+        'Name': schedule_name,
+        'GroupName': scheduler_group_name,
+        'ScheduleExpression': formatted_schedule,
+        'ScheduleExpressionTimezone': timezone_name or 'UTC',
+        'FlexibleTimeWindow': {'Mode': 'OFF'},
+        'State': 'ENABLED',
+        'Target': target,
+    }
     try:
-        if not eventbridge_client.list_rules(NamePrefix=rule_name).get('Rules'):
-            return
-        eventbridge_client.remove_targets(Rule=rule_name, Ids=[target_id])
-        eventbridge_client.delete_rule(Name=rule_name)
-        logger.info(f"Removed schedule rule {rule_name}")
+        scheduler_client.update_schedule(**params)
+        logger.info(f"{action} schedule updated for {instance_id}: {formatted_schedule} ({timezone_name})")
+    except scheduler_client.exceptions.ResourceNotFoundException:
+        scheduler_client.create_schedule(**params)
+        logger.info(f"{action} schedule created for {instance_id}: {formatted_schedule} ({timezone_name})")
+
+
+def _remove_schedule(schedule_name):
+    """Remove an EventBridge Scheduler schedule if it exists."""
+    try:
+        scheduler_client.delete_schedule(Name=schedule_name, GroupName=scheduler_group_name)
+        logger.info(f"Removed schedule {schedule_name}")
+    except scheduler_client.exceptions.ResourceNotFoundException:
+        pass
     except ClientError as e:
-        logger.error(f"Error removing schedule rule {rule_name}: {e}")
+        logger.error(f"Error removing schedule {schedule_name}: {e}")
 
 
 def _configure_schedule_shutdown(instance_id, arguments):
-    """Configure or remove start/stop EventBridge schedules."""
+    """Configure or remove start/stop EventBridge Scheduler schedules."""
     timezone_name = arguments.get('timezone', 'UTC')
 
     stop_schedule = arguments.get('stopScheduleExpression')
     if stop_schedule:
-        formatted = _format_schedule_expression(stop_schedule, timezone_name)
+        formatted = _format_schedule_expression(stop_schedule)
         if not formatted:
             raise ValueError(f"Invalid stop cron expression: {stop_schedule}")
-        _put_schedule_rule(f"shutdown-{instance_id}", f"shutdown-target-{instance_id}", formatted, "stopServer", instance_id)
+        _put_schedule(f"shutdown-{instance_id}", formatted, timezone_name, "stopServer", instance_id)
     else:
-        _remove_schedule_rule(f"shutdown-{instance_id}", f"shutdown-target-{instance_id}")
+        _remove_schedule(f"shutdown-{instance_id}")
 
     start_schedule = arguments.get('startScheduleExpression')
     if start_schedule:
-        formatted = _format_schedule_expression(start_schedule, timezone_name)
+        formatted = _format_schedule_expression(start_schedule)
         if not formatted:
             raise ValueError(f"Invalid start cron expression: {start_schedule}")
-        _put_schedule_rule(f"start-{instance_id}", f"start-target-{instance_id}", formatted, "startServer", instance_id)
+        _put_schedule(f"start-{instance_id}", formatted, timezone_name, "startServer", instance_id)
     else:
-        _remove_schedule_rule(f"start-{instance_id}", f"start-target-{instance_id}")
+        _remove_schedule(f"start-{instance_id}")
+
+
 
 
 def handle_update_server_config(instance_id, arguments):

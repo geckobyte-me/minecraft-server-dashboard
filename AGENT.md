@@ -64,9 +64,9 @@ Deploy order: **DynamoDB → Cognito → EC2 → Lambdas**. Each nested template
 ### Server control (synchronous start/stop)
 `ec2ActionValidator` is the single AppSync-backed Lambda for writes and most reads. It validates Cognito auth and per-server membership, then executes **synchronously** — there is no SQS queue or separate worker. Flow:
 - `startServer` / `stopServer` → validate state → `ec2:StartInstances` / `ec2:StopInstances` → broadcast progress via `putec2ActionValidatorStatus` (PROCESSING → COMPLETED/FAILED), which the frontend receives over the `onPutec2ActionValidatorStatus` subscription.
-- `putServerConfig` / `updateServerConfig` → persist config to DynamoDB, then apply the auto-shutdown alarm and EventBridge schedule rules.
+- `putServerConfig` / `updateServerConfig` → persist config to DynamoDB, then apply the auto-shutdown alarm and EventBridge Scheduler schedules.
 
-Scheduled EventBridge rules invoke `ec2ActionValidator` directly (not GraphQL) with `{"action": "startServer"|"stopServer", "instanceId", "source": "scheduled-..."}`; the handler detects this shape and runs as `system`.
+Scheduled invocations come from **EventBridge Scheduler** (not the legacy EventBridge rules / default event bus). Scheduler assumes `SchedulerExecutionRole` and invokes `ec2ActionValidator` directly with `{"action": "startServer"|"stopServer", "instanceId", "source": "scheduled-..."}`; the handler detects this shape and runs as `system`.
 
 > IAM profile management (`iamProfileManager`) is a separate synchronous Lambda. It requires `iam:PassRole` on the EC2 **role** ARN (not the instance profile ARN) and associates the instance profile so the CloudWatch agent can publish metrics.
 
@@ -80,7 +80,7 @@ A single CloudWatch metric alarm with the native `ec2:stop` action (no Lambda in
 
 The alarm fires when the metric stays `<=` threshold for `alarmEvaluationPeriod` consecutive minutes. A threshold of 0 removes the alarm.
 
-- **Scheduled start/stop**: EventBridge rules (`start-{id}` / `shutdown-{id}`). Frontend sends 5-field cron; `ec2ActionValidator._format_schedule_expression` converts it to EventBridge 6-field cron (and local→UTC via `timezone`).
+- **Scheduled start/stop**: EventBridge Scheduler schedules (`start-{id}` / `shutdown-{id}`) created at runtime by `ec2ActionValidator` in the `${ProjectName}-${EnvironmentName}` schedule group (e.g. `msd-dev`). Frontend sends 5-field cron; `ec2ActionValidator._format_schedule_expression` normalizes it to a 6-field EventBridge `cron(...)` expression. The user's `timezone` is passed to Scheduler via `ScheduleExpressionTimezone` (Scheduler handles local→UTC and DST), so the stored cron is **not** manually converted to UTC. An empty expression deletes the corresponding schedule. Scheduler invokes the Lambda using `SchedulerExecutionRole` (both the role and the schedule group are defined in `cfn/templates/lambdas.yaml`). These appear under **EventBridge → Schedules** (not **Rules**) in the console.
 
 ### Metrics (option B — CloudWatch agent)
 Dashboard stats come from the standard CloudWatch agent the user installs:
@@ -158,7 +158,7 @@ ID come from stack outputs, not env vars.
 
 - Lambda functions and layers are both defined in `cfn/templates/lambdas.yaml`; update CloudFormation when adding either.
 - When changing a GraphQL operation, keep `appsync/schema.graphql`, the resolver wiring in `lambdas.yaml`, the Lambda handler, and the frontend `webapp/src/graphql/` files in sync. AppSync rejects response objects containing fields not in the schema — trim Lambda/`ddbHelper` return shapes to match.
-- Start/stop/config run synchronously in `ec2ActionValidator`; there is no SQS worker. Scheduled rules invoke the same Lambda directly.
+- Start/stop/config run synchronously in `ec2ActionValidator`; there is no SQS worker. Scheduled EventBridge Scheduler schedules invoke the same Lambda directly, via `SchedulerExecutionRole`.
 - The layer Makefiles build Python deps via `$(PYTHON)` (defaults to `python3`). On pyenv-based CI images, SAM's builders need a real interpreter, not a pyenv shim: the backend job prepends the concrete `python3.14` bin dir to PATH and exports `PYTHON`. Template validation and `py_compile` are reliable local checks.
 - Deploy prerequisites that are NOT in the templates: the `/minecraft/GOOGLE_CLIENT_ID` and `/minecraft/GOOGLE_SECRET` SSM params (see Pre-Deploy Prerequisites) and the CircleCI OIDC roles. A fresh account fails without them.
 - Do not commit secrets. Sensitive config belongs in SSM Parameter Store; frontend values come from CloudFormation outputs via `VITE_`-prefixed env vars.

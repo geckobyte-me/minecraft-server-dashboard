@@ -34,7 +34,7 @@
           icon 
           size="small"
           variant="text"
-          :disabled="!isRunning || isDisabled"
+          :disabled="isDisabled"
           @click="$emit('settings', server)"
         >
           <span class="material-symbols-outlined">settings</span>
