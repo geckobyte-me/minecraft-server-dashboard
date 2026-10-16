@@ -453,6 +453,12 @@ Resources:
         - !Ref AuthLayer
         - !Ref Ec2Layer
         - !Ref DdbLayer
+      Environment:
+        Variables:
+          # ARN of the iamProfileManager function used by auto_fix_iam_if_needed
+          # to asynchronously reconcile the EC2 instance profile when iamStatus
+          # is not 'ok'. Merged with the shared Globals environment variables.
+          FIX_SERVER_ROLE_LAMBDA_ARN: !GetAtt iamProfileManager.Arn
       Policies:
         - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
         - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
@@ -467,6 +473,12 @@ Resources:
                 - dynamodb:Query
               Resource:
                 Fn::ImportValue: !Sub "${ProjectName}-${EnvironmentName}-CoreTable"
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt iamProfileManager.Arn
 
   ec2ActionValidator:
     Type: AWS::Serverless::Function
