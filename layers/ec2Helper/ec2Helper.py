@@ -28,6 +28,7 @@ class Ec2Utils:
         self.account_id = self.sts_client.get_caller_identity()['Account']
         self.appValue = os.getenv('TAG_APP_VALUE')
         self.ec2InstanceProfileArn = os.getenv('EC2_INSTANCE_PROFILE_ARN')
+        self.ec2InstanceProfileName = os.getenv('EC2_INSTANCE_PROFILE_NAME')
 
     def get_latest_ubuntu_ami(self):
         """
@@ -604,7 +605,161 @@ class Ec2Utils:
         ), None)
 
         return matching_association
-                 
+
+    def _wait_for_association_state(self, instance_id, status, association_id=None,
+                                    max_attempts=30, delay=5):
+        """Poll describe_iam_profile until the association reaches ``status``.
+
+        Args:
+            instance_id (str): EC2 instance ID.
+            status (str): Desired association state, e.g. "associated" or
+                "disassociated".
+            association_id (str, optional): Specific association to track.
+            max_attempts (int): Number of polling attempts.
+            delay (int): Seconds between attempts.
+
+        Returns:
+            dict | None: The matching association when reached, else None.
+        """
+        import time
+        for attempt in range(max_attempts):
+            try:
+                result = self.describe_iam_profile(instance_id, status, association_id)
+                if result is not None:
+                    return result
+            except Exception as e:
+                logger.warning(
+                    f"Error polling IAM profile state ({status}) for "
+                    f"{instance_id}: {e}"
+                )
+            time.sleep(delay)
+        return None
+
+    def associate_iam_profile(self, instance_id, wait=True):
+        """Attach the dashboard IAM instance profile to an instance.
+
+        Uses the profile name from EC2_INSTANCE_PROFILE_NAME. Optionally waits
+        until the association is reported as "associated" with the expected ARN.
+
+        Returns:
+            dict: {"status": "success"|"error", "message": str, ...}
+        """
+        logger.info(f"------- associate_iam_profile: {instance_id}")
+
+        if not self.ec2InstanceProfileName:
+            return {"status": "error",
+                    "message": "EC2_INSTANCE_PROFILE_NAME not configured"}
+
+        try:
+            response = self.ec2_client.associate_iam_instance_profile(
+                IamInstanceProfile={"Name": self.ec2InstanceProfileName},
+                InstanceId=instance_id
+            )
+            logger.info(f"associate_iam_instance_profile response: {response}")
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            error_message = e.response.get('Error', {}).get('Message', str(e))
+            logger.error(
+                f"Error attaching IAM profile to {instance_id}: "
+                f"{error_code} - {error_message}"
+            )
+            if error_code == 'UnauthorizedOperation':
+                return {"status": "error",
+                        "message": "Unauthorized to attach IAM profile",
+                        "code": "UnauthorizedOperation"}
+            return {"status": "error",
+                    "message": f"Failed to attach IAM profile: {error_message}"}
+        except Exception as e:
+            logger.error(f"Unexpected error attaching IAM profile to {instance_id}: {e}")
+            return {"status": "error",
+                    "message": f"Failed to attach IAM profile: {str(e)}"}
+
+        if not wait:
+            return {"status": "success", "message": "IAM profile association requested"}
+
+        associated = self._wait_for_association_state(instance_id, "associated")
+        if associated and associated.get('Arn') == self.ec2InstanceProfileArn:
+            return {"status": "success", "message": "IAM profile attached successfully"}
+
+        logger.warning(f"Timeout waiting for IAM profile attachment on {instance_id}")
+        return {"status": "error", "message": "Timeout waiting for profile attachment"}
+
+    def disassociate_iam_profile(self, instance_id, association_id, wait=True):
+        """Remove an existing IAM instance profile association.
+
+        Returns:
+            bool: True if disassociated (or already absent), False on error.
+        """
+        logger.info(f"------- disassociate_iam_profile: {instance_id} ({association_id})")
+
+        try:
+            self.ec2_client.disassociate_iam_instance_profile(
+                AssociationId=association_id
+            )
+        except ClientError as e:
+            if "InvalidAssociationID.NotFound" in str(e):
+                logger.warning(
+                    f"Association ID not found: {association_id}. Treating as removed."
+                )
+                return True
+            logger.error(f"Error disassociating IAM profile {association_id}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error disassociating IAM profile {association_id}: {e}")
+            return False
+
+        if not wait:
+            return True
+
+        # describe_iam_profile returns the matching record while it is still in
+        # the "disassociating"/"disassociated" state; a None result means the
+        # association is fully gone, which is also success.
+        self._wait_for_association_state(
+            instance_id, "disassociated", association_id
+        )
+        return True
+
+    def ensure_iam_profile(self, instance_id):
+        """Ensure the instance is attached to the dashboard IAM instance profile.
+
+        Idempotent reconciliation used when an instance is connected/validated:
+          - If the correct profile is already associated: no-op.
+          - If a different profile is associated: disassociate it, then attach.
+          - If no profile is associated: attach.
+
+        Returns:
+            dict: {"status": "success"|"error", "message": str, ...}
+        """
+        logger.info(f"------- ensure_iam_profile: {instance_id}")
+
+        if not self.ec2InstanceProfileArn or not self.ec2InstanceProfileName:
+            return {"status": "error",
+                    "message": "EC2 instance profile name/ARN not configured"}
+
+        try:
+            current = self.describe_iam_profile(instance_id, "associated")
+        except Exception as e:
+            logger.warning(
+                f"Error describing IAM profile for {instance_id}: {e}. "
+                f"Will attempt to attach profile anyway."
+            )
+            current = None
+
+        if current and current.get('Arn') == self.ec2InstanceProfileArn:
+            logger.info(f"IAM profile already correct for {instance_id}: {current['Arn']}")
+            return {"status": "success", "message": "IAM profile already correct"}
+
+        if current:
+            logger.info(
+                f"IAM profile is incorrect for {instance_id} "
+                f"({current.get('Arn')}); replacing."
+            )
+            if not self.disassociate_iam_profile(instance_id, current['AssociationId']):
+                return {"status": "error",
+                        "message": "Failed to disassociate existing profile"}
+
+        return self.associate_iam_profile(instance_id)
+
     def describe_instance_status(self, instance_id):
         logger.info(f"------- describe_instance_status: {instance_id}") 
         iamStatus = 'fail'

@@ -209,7 +209,7 @@ def manage_scheduled_rule(increment=True):
             else:
                 raise
 
-def state_change_response(instance_id):
+def state_change_response(instance_id, event_state=None):
     logger.info("------- state_change_response: " + instance_id)
 
     server_info = ec2_utils.list_server_by_id(instance_id)
@@ -234,12 +234,25 @@ def state_change_response(instance_id):
     # Converting to PST as the logs are in PST        
     pstLaunchTime = launchTime.astimezone(pst)
 
+    # The EventBridge state-change event is the authoritative source for the
+    # transition that just occurred. describe_instances is eventually consistent
+    # and can still report the previous state (e.g. "stopped" right after a
+    # "running" event), which would make the app never show the instance as up.
+    # Prefer the event state and fall back to the describe result only if absent.
+    describe_state = instance_info["State"]["Name"].lower()
+    resolved_state = event_state.lower() if event_state else describe_state
+    if event_state and resolved_state != describe_state:
+        logger.info(
+            f"Using event state '{resolved_state}' over stale describe state "
+            f"'{describe_state}' for {instance_id}"
+        )
+
     # building payload
     input = {
         "id": instance_id,
         "name": instanceName,
         "type": instance_info["InstanceType"],
-        "state": instance_info["State"]["Name"].lower(),
+        "state": resolved_state,
         "iamStatus": ec2Status["iamStatus"].lower(),
         "launchTime": pstLaunchTime.strftime("%m/%d/%Y - %H:%M:%S"),
         "publicIp": publicIp
@@ -290,7 +303,7 @@ def handle_instance_state_change(event):
             logger.error(f"Failed to log state transition for {instance_id}: {e}")
 
     # Send state change notification
-    input_data = state_change_response(instance_id)
+    input_data = state_change_response(instance_id, event_state=state)
     if not input_data:
         logger.error(f"Failed to get state change data for {instance_id}")
         return

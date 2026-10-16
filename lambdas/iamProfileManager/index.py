@@ -1,4 +1,3 @@
-import boto3
 import logging
 import os
 import authHelper
@@ -8,127 +7,33 @@ import utilHelper
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-ec2_client = boto3.client('ec2')
 ec2_utils = ec2Helper.Ec2Utils()
 utl = utilHelper.Utils()
 
 # Environment variables
-ec2_instance_profile_name = os.getenv('EC2_INSTANCE_PROFILE_NAME')
-ec2_instance_profile_arn = os.getenv('EC2_INSTANCE_PROFILE_ARN')
 cognito_pool_id = os.getenv('COGNITO_USER_POOL_ID')
 
 auth = authHelper.Auth(cognito_pool_id)
 
 
 class IamProfile:
-    """Manages IAM instance profile association for EC2 instances"""
-    
+    """Manages IAM instance profile association for EC2 instances.
+
+    Thin wrapper that delegates the association lifecycle to
+    ec2Helper.Ec2Utils, which owns the canonical implementation.
+    """
+
     def __init__(self, instance_id):
-        self.ec2_client = boto3.client('ec2')
         self.instance_id = instance_id
-        self.association_id = None
 
     def manage_iam_profile(self):
         """
-        Ensure instance has the correct IAM profile attached
-        
+        Ensure instance has the correct IAM profile attached.
+
         Returns:
             dict: Status response with success/error information
         """
-        try:
-            iam_profile = ec2_utils.describe_iam_profile(self.instance_id, "associated")
-
-            if iam_profile and iam_profile['Arn'] == ec2_instance_profile_arn:
-                logger.info(f"Instance IAM Profile is already valid: {iam_profile['Arn']}")
-                return {"status": "success", "message": "IAM profile already correct"}
-            elif iam_profile:
-                logger.info(f"Instance IAM Profile is invalid: {iam_profile['Arn']}")
-                self.association_id = iam_profile['AssociationId']
-                rsp = self.disassociate_iam_profile()
-                if not rsp:
-                    return {"status": "error", "message": "Failed to disassociate existing profile"}
-        except Exception as e:
-            logger.warning(f"Error describing IAM profile: {str(e)}. Will attempt to attach profile anyway.")
-
-        logger.info("Attaching IAM role to the Minecraft Instance")
-        return self.attach_iam_profile()
-
-    def disassociate_iam_profile(self):
-        """
-        Remove existing IAM profile association
-        
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        logger.info(f"Disassociating IAM profile: {self.association_id}")
-        try:
-            self.ec2_client.disassociate_iam_instance_profile(AssociationId=self.association_id)
-        except Exception as e:
-            if "InvalidAssociationID.NotFound" in str(e):
-                logger.warning(f"Association ID not found: {self.association_id}. Continuing...")
-                return True
-            else:
-                logger.error(f"Error disassociating IAM profile: {str(e)}")
-                return False
-
-        # Check if profile is fully disassociated
-        def check_disassociated_status():
-            try:
-                return ec2_utils.describe_iam_profile(
-                    self.instance_id, 
-                    "disassociated", 
-                    self.association_id
-                ) is not None
-            except Exception as e:
-                logger.warning(f"Error checking disassociation status: {str(e)}. Assuming disassociated.")
-                return True
-
-        # Retry checking disassociation status
-        if not utl.retry_operation(check_disassociated_status, max_retries=30, delay=5):
-            logger.warning("Profile timeout during disassociating")
-            return True  # Continue anyway
-
-        return True
-    
-    def attach_iam_profile(self):
-        """
-        Attach the correct IAM profile to the instance
-        
-        Returns:
-            dict: Status response with success/error information
-        """
-        logger.info(f"Attaching IAM profile: {ec2_instance_profile_name}")
-        
-        try:
-            response = self.ec2_client.associate_iam_instance_profile(
-                IamInstanceProfile={"Name": ec2_instance_profile_name},
-                InstanceId=self.instance_id
-            )
-            logger.info(response)
-        except Exception as e:
-            error_msg = str(e)
-            if "UnauthorizedOperation" in error_msg:
-                logger.error(f"Unauthorized operation when attaching IAM profile: {error_msg}")
-                return {"status": "error", "message": "Unauthorized to attach IAM profile", "code": "UnauthorizedOperation"}
-            else:
-                logger.error(f"Error attaching IAM profile: {error_msg}")
-                return {"status": "error", "message": f"Failed to attach IAM profile: {error_msg}"}
-
-        # Check if profile is properly attached
-        def check_associated_status():
-            try:
-                iam_profile = ec2_utils.describe_iam_profile(self.instance_id, "associated")
-                return iam_profile and iam_profile['Arn'] == ec2_instance_profile_arn
-            except Exception as e:
-                logger.warning(f"Error checking association status: {str(e)}")
-                return False
-
-        # Retry checking profile association status
-        if not utl.retry_operation(check_associated_status, max_retries=30, delay=5):
-            logger.warning("Profile timeout during association")
-            return {"status": "error", "message": "Timeout waiting for profile attachment"}
-
-        return {"status": "success", "message": "IAM profile attached successfully"}
+        return ec2_utils.ensure_iam_profile(self.instance_id)
 
 
 def check_authorization(event, instance_id, user_attributes):
