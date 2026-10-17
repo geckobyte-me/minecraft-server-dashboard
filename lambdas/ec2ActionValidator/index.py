@@ -242,6 +242,69 @@ def _format_schedule_expression(cron_expression):
         return None
 
 
+def _parse_schedule_crons(schedule_value):
+    """Normalize a schedule config value into a list of 5-field cron strings.
+
+    Accepts any of:
+      * ``None`` / empty              -> ``[]``
+      * a single cron string          -> ``[cron]``
+      * a JSON array of cron strings  -> ``[cron, cron, ...]``
+
+    This keeps backward compatibility with the original single-cron format
+    while supporting multiple per-weekday rules (e.g. weekdays vs weekends),
+    where each rule is serialized as its own cron entry.
+    """
+    if not schedule_value:
+        return []
+
+    # Already a list (e.g. passed directly as a Python list).
+    if isinstance(schedule_value, list):
+        return [str(c).strip() for c in schedule_value if c and str(c).strip()]
+
+    if isinstance(schedule_value, str):
+        value = schedule_value.strip()
+        if not value:
+            return []
+        # Try to decode a JSON array first; fall back to a single cron string.
+        if value.startswith('['):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    return [str(c).strip() for c in parsed if c and str(c).strip()]
+            except (ValueError, TypeError):
+                logger.warning(f"Could not parse schedule JSON, treating as single cron: {value}")
+        return [value]
+
+    return []
+
+
+def _format_schedule_crons(schedule_value, label):
+    """Parse + validate a schedule value into EventBridge cron() expressions.
+
+    Raises ``ValueError`` if any entry is an invalid cron expression.
+    """
+    formatted = []
+    for cron in _parse_schedule_crons(schedule_value):
+        result = _format_schedule_expression(cron)
+        if not result:
+            raise ValueError(f"Invalid {label} cron expression: {cron}")
+        formatted.append(result)
+    return formatted
+
+
+def _list_schedule_names(prefix):
+    """Return all existing schedule names in the group that start with prefix."""
+    names = []
+    try:
+        paginator = scheduler_client.get_paginator('list_schedules')
+        for page in paginator.paginate(GroupName=scheduler_group_name, NamePrefix=prefix):
+            for schedule in page.get('Schedules', []):
+                names.append(schedule['Name'])
+    except ClientError as e:
+        logger.error(f"Error listing schedules with prefix {prefix}: {e}")
+    return names
+
+
 def _put_schedule(schedule_name, formatted_schedule, timezone_name, action, instance_id):
     """Create or update an EventBridge Scheduler schedule that invokes this
     Lambda to start/stop the instance."""
@@ -279,27 +342,43 @@ def _remove_schedule(schedule_name):
         logger.error(f"Error removing schedule {schedule_name}: {e}")
 
 
+def _apply_schedules(base_name, formatted_crons, timezone_name, action, instance_id):
+    """Create/update one EventBridge schedule per cron and delete stale ones.
+
+    Schedules are named ``{base_name}-{index}`` (e.g. ``start-i-0abc-0``).
+    Any previously-created indexed schedules beyond the current count, plus the
+    legacy un-indexed ``{base_name}`` schedule, are removed so no orphan rules
+    linger when the number of rules shrinks or scheduling is disabled.
+    """
+    # Create/update the schedule for each cron rule.
+    for index, formatted in enumerate(formatted_crons):
+        _put_schedule(f"{base_name}-{index}", formatted, timezone_name, action, instance_id)
+
+    # Clean up any stale schedules that this instance previously created.
+    keep = {f"{base_name}-{i}" for i in range(len(formatted_crons))}
+    for name in _list_schedule_names(f"{base_name}-"):
+        if name not in keep:
+            _remove_schedule(name)
+
+    # Remove the legacy single-schedule name (pre per-weekday format).
+    _remove_schedule(base_name)
+
+
 def _configure_schedule_shutdown(instance_id, arguments):
-    """Configure or remove start/stop EventBridge Scheduler schedules."""
+    """Configure or remove start/stop EventBridge Scheduler schedules.
+
+    Each of the start/stop schedule expressions may be a single cron string
+    (legacy) or a JSON array of cron strings (one per weekday-group rule). One
+    EventBridge schedule is created per cron.
+    """
     timezone_name = arguments.get('timezone', 'UTC')
 
-    stop_schedule = arguments.get('stopScheduleExpression')
-    if stop_schedule:
-        formatted = _format_schedule_expression(stop_schedule)
-        if not formatted:
-            raise ValueError(f"Invalid stop cron expression: {stop_schedule}")
-        _put_schedule(f"shutdown-{instance_id}", formatted, timezone_name, "stopServer", instance_id)
-    else:
-        _remove_schedule(f"shutdown-{instance_id}")
+    stop_crons = _format_schedule_crons(arguments.get('stopScheduleExpression'), 'stop')
+    _apply_schedules(f"shutdown-{instance_id}", stop_crons, timezone_name, "stopServer", instance_id)
 
-    start_schedule = arguments.get('startScheduleExpression')
-    if start_schedule:
-        formatted = _format_schedule_expression(start_schedule)
-        if not formatted:
-            raise ValueError(f"Invalid start cron expression: {start_schedule}")
-        _put_schedule(f"start-{instance_id}", formatted, timezone_name, "startServer", instance_id)
-    else:
-        _remove_schedule(f"start-{instance_id}")
+    start_crons = _format_schedule_crons(arguments.get('startScheduleExpression'), 'start')
+    _apply_schedules(f"start-{instance_id}", start_crons, timezone_name, "startServer", instance_id)
+
 
 
 
